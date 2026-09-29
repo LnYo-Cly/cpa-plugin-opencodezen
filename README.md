@@ -79,6 +79,28 @@ plugins:
 > - 插件默认已注册以下免费模型：`mimo-v2.6-flash-free`、`mimo-v2.5-free`、`ling-3.0-flash-fin-free`、`nemotron-3-ultra-free`、`muse-spark-1.3-contributor-free`。
 > - 如果官方上线了新模型，可以在该 JSON 文件中添加 `"models": [{"name": "新模型名"}]` 即可动态生效，无需重新编译插件。
 
+### 3. 模型能力元数据（上下文窗口等）
+
+插件会向 CPA 宣告模型能力元数据（上下文窗口、输出上限、输入模态、推理档位），下游客户端（pi、Codex 等）通过 `/v1/models` 读取 `context_window` / `max_tokens` 等字段。内置默认值：mimo 系列为 1M 上下文。
+
+如需覆盖或为其他模型声明能力，在 `config.yaml` 的 `plugins.configs.zen.models` 中配置：
+
+```yaml
+plugins:
+  enabled: true
+  dir: "plugins"
+  configs:
+    zen:
+      enabled: true
+      models:
+        - model: nemotron-3-ultra-free
+          context-length: 1000000        # 上下文窗口（token 数）
+          max-completion-tokens: 32768   # 最大输出 token 数
+          input-modalities:              # 输入模态：text / image
+            - text
+          reasoning-levels: none, low, medium, high  # 推理档位
+```
+
 ---
 
 ## 验证与测试

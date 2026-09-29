@@ -87,7 +87,7 @@ const (
 	defaultUserAgent = "opencode/1.18.31 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14"
 )
 
-var pluginVersion = "0.3.0"
+var pluginVersion = "0.4.2"
 
 var (
 	canonicalSessionRe = regexp.MustCompile(`^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$`)
@@ -116,6 +116,13 @@ type modelRoute struct {
 	Model    string
 	Endpoint string // "chat" (default) or "responses"
 	Alias    string
+
+	// Optional capability metadata announced to the host model registry.
+	// Explicit values override the built-in defaults for the model.
+	ContextLength       int64    // yaml: context-length
+	MaxCompletionTokens int64    // yaml: max-completion-tokens
+	InputModalities     []string // yaml: input-modalities
+	ReasoningLevels     []string // yaml: reasoning-levels
 }
 
 // EndpointPath returns the upstream path suffix for this route.
@@ -271,6 +278,10 @@ func applyConfigNode(cfg *pluginConfig, node map[string]any) {
 			if s, ok := entry["alias"].(string); ok {
 				m.Alias = s
 			}
+			m.ContextLength = intValue(entry["context-length"], entry["context_length"])
+			m.MaxCompletionTokens = intValue(entry["max-completion-tokens"], entry["max_completion_tokens"])
+			m.InputModalities = stringSliceValue(entry["input-modalities"], entry["input_modalities"])
+			m.ReasoningLevels = stringSliceValue(entry["reasoning-levels"], entry["reasoning_levels"])
 			if m.Model != "" {
 				cfg.Models = append(cfg.Models, m)
 			}
@@ -287,6 +298,53 @@ func boolValue(v any) bool {
 	default:
 		return false
 	}
+}
+
+// intValue returns the first numeric value among candidates as int64.
+func intValue(values ...any) int64 {
+	for _, v := range values {
+		switch t := v.(type) {
+		case int:
+			return int64(t)
+		case int64:
+			return t
+		case float64:
+			return int64(t)
+		}
+	}
+	return 0
+}
+
+// stringSliceValue returns the first non-empty string slice among candidates.
+// Accepts a YAML list or a comma-separated string.
+func stringSliceValue(values ...any) []string {
+	for _, v := range values {
+		switch t := v.(type) {
+		case []any:
+			out := make([]string, 0, len(t))
+			for _, item := range t {
+				if s, ok := item.(string); ok {
+					if s = strings.TrimSpace(s); s != "" {
+						out = append(out, s)
+					}
+				}
+			}
+			if len(out) > 0 {
+				return out
+			}
+		case string:
+			var out []string
+			for _, part := range strings.Split(t, ",") {
+				if part = strings.TrimSpace(part); part != "" {
+					out = append(out, part)
+				}
+			}
+			if len(out) > 0 {
+				return out
+			}
+		}
+	}
+	return nil
 }
 
 // defaultModelRoutes defines the built-in routing for known Zen models.
@@ -379,6 +437,31 @@ type modelInfo struct {
 	OwnedBy     string `json:"OwnedBy"`
 	Type        string `json:"Type"`
 	DisplayName string `json:"DisplayName"`
+
+	// Capability metadata consumed by the host model registry and forwarded
+	// to clients as context_window / max_tokens / input_modalities /
+	// supported_reasoning_levels. Zero values are omitted.
+	ContextLength            int64            `json:"ContextLength,omitempty"`
+	MaxCompletionTokens      int64            `json:"MaxCompletionTokens,omitempty"`
+	SupportedInputModalities []string         `json:"SupportedInputModalities,omitempty"`
+	Thinking                 *thinkingSupport `json:"Thinking,omitempty"`
+}
+
+// thinkingSupport mirrors the host plugin SDK ThinkingSupport shape.
+type thinkingSupport struct {
+	Min            int      `json:"Min,omitempty"`
+	Max            int      `json:"Max,omitempty"`
+	ZeroAllowed    bool     `json:"ZeroAllowed,omitempty"`
+	DynamicAllowed bool     `json:"DynamicAllowed,omitempty"`
+	Levels         []string `json:"Levels,omitempty"`
+}
+
+// modelCapabilities is the resolved capability metadata for one model.
+type modelCapabilities struct {
+	ContextLength       int64
+	MaxCompletionTokens int64
+	InputModalities     []string
+	Thinking            *thinkingSupport
 }
 
 type modelRegistrationResponse struct {
@@ -719,6 +802,38 @@ var defaultZenModels = []modelRoute{
 	{Model: "muse-spark-1.3-contributor-free", Alias: "muse-spark-1.3-contributor-free", Endpoint: "responses"},
 }
 
+// defaultModelCapabilities announces built-in capability metadata for known
+// Zen free-tier models. Values can be overridden per model through
+// plugins.configs.zen models entries (context-length, max-completion-tokens,
+// input-modalities, reasoning-levels).
+var defaultModelCapabilities = map[string]modelCapabilities{
+	"mimo-v2.6-flash-free": {ContextLength: 1000000},
+	"mimo-v2.5-free":       {ContextLength: 1000000},
+}
+
+// resolveModelCapabilities merges built-in defaults with explicit route
+// configuration; explicit values win.
+func resolveModelCapabilities(m modelRoute) modelCapabilities {
+	caps := defaultModelCapabilities[strings.ToLower(strings.TrimSpace(m.Model))]
+	if m.ContextLength > 0 {
+		caps.ContextLength = m.ContextLength
+	}
+	if m.MaxCompletionTokens > 0 {
+		caps.MaxCompletionTokens = m.MaxCompletionTokens
+	}
+	if len(m.InputModalities) > 0 {
+		caps.InputModalities = m.InputModalities
+	}
+	if len(m.ReasoningLevels) > 0 {
+		caps.Thinking = &thinkingSupport{
+			ZeroAllowed:    true,
+			DynamicAllowed: true,
+			Levels:         m.ReasoningLevels,
+		}
+	}
+	return caps
+}
+
 // modelRegistration announces supported Zen models to CPA.
 // If the user configured custom models in plugins.configs.zen, it announces those;
 // otherwise it announces the default set of Zen free-tier models.
@@ -737,13 +852,18 @@ func modelRegistration() ([]byte, error) {
 		if alias == "" {
 			alias = m.Model
 		}
+		caps := resolveModelCapabilities(m)
 		models = append(models, modelInfo{
-			ID:          alias,
-			Object:      "model",
-			Created:     1735689600,
-			OwnedBy:     cfg.Provider,
-			Type:        "openai",
-			DisplayName: m.Model,
+			ID:                       alias,
+			Object:                   "model",
+			Created:                  1735689600,
+			OwnedBy:                  cfg.Provider,
+			Type:                     "openai",
+			DisplayName:              m.Model,
+			ContextLength:            caps.ContextLength,
+			MaxCompletionTokens:      caps.MaxCompletionTokens,
+			SupportedInputModalities: caps.InputModalities,
+			Thinking:                 caps.Thinking,
 		})
 	}
 	return okEnvelopeJSON(modelRegistrationResponse{
@@ -899,6 +1019,12 @@ func runStream(req executorRequest, cfg pluginConfig, route modelRoute, endpoint
 		return
 	}
 
+	// Chat-completions clients get their SSE framing applied by the host
+	// itself; emitting pre-framed "data: ..." lines there produces doubled
+	// prefixes. Responses clients go through the host response
+	// translator, which expects complete SSE frames.
+	rawData := strings.Contains(strings.ToLower(strings.TrimSpace(req.SourceFormat)), "chat")
+
 	var lineBuf bytes.Buffer
 	for {
 		chunk, err := readHostStream(resp.StreamID)
@@ -909,7 +1035,7 @@ func runStream(req executorRequest, cfg pluginConfig, route modelRoute, endpoint
 		if chunk.Done {
 			// Flush any trailing line in buffer before closing
 			if lineBuf.Len() > 0 {
-				_ = emitStreamChunk(streamID, lineBuf.Bytes())
+				_ = emitStreamChunk(streamID, lineBuf.Bytes(), rawData)
 				lineBuf.Reset()
 			}
 			break
@@ -930,7 +1056,7 @@ func runStream(req executorRequest, cfg pluginConfig, route modelRoute, endpoint
 				copy(line, data[:idx])
 				lineBuf.Next(idx + 1)
 
-				if err := emitStreamChunk(streamID, line); err != nil {
+				if err := emitStreamChunk(streamID, line, rawData); err != nil {
 					closeStream(err.Error())
 					return
 				}
@@ -1058,6 +1184,11 @@ func prepareUpstreamBody(req executorRequest, route modelRoute) ([]byte, error) 
 	if err := convertBodyDialect(root, route.Endpoint); err != nil {
 		return nil, err
 	}
+	// Repair host-translated payloads before they reach zen: the host's
+	// protocol translation can emit shapes zen's strict validator rejects
+	// with 400 (text parts without a usable "text" field, roleless messages
+	// from reasoning items, null content).
+	sanitizeChatMessages(root)
 	root["stream"] = true
 
 	dialect, known := bodyDialect(root)
@@ -1070,6 +1201,64 @@ func prepareUpstreamBody(req executorRequest, route modelRoute) ([]byte, error) 
 		return nil, err
 	}
 	return out, nil
+}
+
+// sanitizeChatMessages repairs a chat-completions payload in place so zen's
+// strict validator never sees malformed content. It drops messages without a
+// usable role (artifacts of translated reasoning items), drops content parts
+// whose declared text is missing or empty, and normalizes null content to ""
+// (zen rejects null content). Valid parts arrays are preserved as arrays.
+func sanitizeChatMessages(root map[string]any) {
+	items, ok := root["messages"].([]any)
+	if !ok {
+		return
+	}
+	out := make([]any, 0, len(items))
+	for _, item := range items {
+		msg, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		role, _ := msg["role"].(string)
+		if role = strings.TrimSpace(role); role == "" {
+			continue
+		}
+		msg["role"] = role
+		switch content := msg["content"].(type) {
+		case []any:
+			kept := make([]any, 0, len(content))
+			for _, p := range content {
+				part, ok := p.(map[string]any)
+				if !ok {
+					continue
+				}
+				partType, _ := part["type"].(string)
+				switch partType {
+				case "text", "input_text", "output_text":
+					text, ok := part["text"].(string)
+					if !ok || strings.TrimSpace(text) == "" {
+						continue
+					}
+					part["type"] = "text"
+					delete(part, "annotations")
+					kept = append(kept, part)
+				default:
+					kept = append(kept, part)
+				}
+			}
+			if len(kept) == 0 {
+				msg["content"] = ""
+			} else {
+				msg["content"] = kept
+			}
+		case nil:
+			msg["content"] = ""
+		}
+		out = append(out, msg)
+	}
+	if len(out) > 0 {
+		root["messages"] = out
+	}
 }
 
 // convertBodyDialect converts a host-translated request between the
@@ -1110,6 +1299,12 @@ func responsesToChat(root map[string]any) error {
 		for _, item := range source {
 			entry, ok := item.(map[string]any)
 			if !ok {
+				continue
+			}
+			// Reasoning items have no chat-completions representation. The
+			// host's translation of them produces malformed messages, so drop
+			// them here when the payload arrives in responses form.
+			if itemType, _ := entry["type"].(string); strings.EqualFold(itemType, "reasoning") {
 				continue
 			}
 			message := map[string]any{"role": entry["role"]}
@@ -1655,8 +1850,11 @@ func readHostStream(streamID string) (httpStreamChunk, error) {
 }
 
 // emitStreamChunk forwards one payload frame through the plugin stream bridge.
-func emitStreamChunk(streamID string, payload []byte) error {
-	frame := normalizeSSEFrame(payload)
+// When rawData is true the payload is emitted as the bare data value and the
+// host applies the SSE framing; otherwise a complete SSE frame is emitted for
+// the host response translator.
+func emitStreamChunk(streamID string, payload []byte, rawData bool) error {
+	frame := normalizeSSEFrame(rawData, payload)
 	if len(frame) == 0 {
 		return nil
 	}
@@ -1667,15 +1865,19 @@ func emitStreamChunk(streamID string, payload []byte) error {
 	return err
 }
 
-// normalizeSSEFrame keeps complete SSE fields intact. The host response
-// translator expects chat-completions SSE frames, including event and data
-// lines; stripping those fields makes /v1/responses see an empty stream.
-func normalizeSSEFrame(raw []byte) []byte {
+// normalizeSSEFrame converts one upstream SSE line into the payload to
+// forward through the host stream bridge. Empty lines, keep-alive comments,
+// and (in raw mode) framing-only lines are dropped. A bare JSON object line is
+// treated as an unframed data payload.
+func normalizeSSEFrame(rawData bool, raw []byte) []byte {
 	s := strings.TrimSpace(string(raw))
 	if s == "" || strings.HasPrefix(s, ":") {
 		return nil
 	}
 	if s == "[DONE]" {
+		if rawData {
+			return []byte("[DONE]")
+		}
 		return []byte("data: [DONE]\n\n")
 	}
 	if after, ok := strings.CutPrefix(s, "data:"); ok {
@@ -1683,12 +1885,21 @@ func normalizeSSEFrame(raw []byte) []byte {
 		if after == "" || strings.HasPrefix(after, ":") {
 			return nil
 		}
+		if rawData {
+			return []byte(after)
+		}
 		return []byte(s + "\n\n")
 	}
 	if strings.HasPrefix(s, "event:") || strings.HasPrefix(s, "id:") || strings.HasPrefix(s, "retry:") {
+		if rawData {
+			return nil
+		}
 		return []byte(s + "\n\n")
 	}
 	if strings.HasPrefix(s, "{") && strings.HasSuffix(s, "}") {
+		if rawData {
+			return []byte(s)
+		}
 		return []byte("data: " + s + "\n\n")
 	}
 	return nil

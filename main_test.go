@@ -17,7 +17,7 @@ func resetConfig(t *testing.T, cfg pluginConfig) {
 }
 
 func TestNormalizeSSEFramePreservesEventLine(t *testing.T) {
-	res := normalizeSSEFrame([]byte("event: response.completed\n"))
+	res := normalizeSSEFrame(false, []byte("event: response.completed\n"))
 	if string(res) != "event: response.completed\n\n" {
 		t.Fatalf("event line = %q", string(res))
 	}
@@ -139,6 +139,57 @@ func TestModelRegistration(t *testing.T) {
 	}
 	if resp.Models[0].ID != "mimo-v2.6-flash-free" || resp.Models[1].ID != "muse-spark-1.3-contributor-free" {
 		t.Fatalf("model IDs = %q %q", resp.Models[0].ID, resp.Models[1].ID)
+	}
+}
+
+func TestModelRegistrationIncludesCapabilities(t *testing.T) {
+	resetConfig(t, testConfig())
+	out, err := modelRegistration()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var env envelope
+	json.Unmarshal(out, &env)
+	var resp modelRegistrationResponse
+	json.Unmarshal(env.Result, &resp)
+	var mimo *modelInfo
+	for i := range resp.Models {
+		if resp.Models[i].ID == "mimo-v2.6-flash-free" {
+			mimo = &resp.Models[i]
+		}
+	}
+	if mimo == nil {
+		t.Fatal("mimo model missing from registration")
+	}
+	if mimo.ContextLength != 1000000 {
+		t.Fatalf("mimo ContextLength = %d, want 1000000", mimo.ContextLength)
+	}
+}
+
+func TestConfigureParsesModelCapabilities(t *testing.T) {
+	raw, _ := json.Marshal(map[string]any{
+		"config_yaml": []byte("models:\n  - model: custom-model\n    endpoint: chat\n    context-length: 2000000\n    max-completion-tokens: 32768\n    input-modalities:\n      - text\n      - image\n    reasoning-levels: none, low, high\n"),
+	})
+	if err := configure(raw); err != nil {
+		t.Fatal(err)
+	}
+	cfg := loadedConfig()
+	if len(cfg.Models) != 1 {
+		t.Fatalf("models = %v", cfg.Models)
+	}
+	m := cfg.Models[0]
+	if m.ContextLength != 2000000 || m.MaxCompletionTokens != 32768 {
+		t.Fatalf("capability values = %+v", m)
+	}
+	if len(m.InputModalities) != 2 || m.InputModalities[0] != "text" || m.InputModalities[1] != "image" {
+		t.Fatalf("input modalities = %v", m.InputModalities)
+	}
+	if len(m.ReasoningLevels) != 3 || m.ReasoningLevels[0] != "none" {
+		t.Fatalf("reasoning levels = %v", m.ReasoningLevels)
+	}
+	caps := resolveModelCapabilities(m)
+	if caps.Thinking == nil || len(caps.Thinking.Levels) != 3 {
+		t.Fatalf("thinking support = %+v", caps.Thinking)
 	}
 }
 
@@ -950,18 +1001,127 @@ func TestExecuteStreamRequiresStreamID(t *testing.T) {
 
 func TestNormalizeSSEFrameDropsKeepAlivesAndComments(t *testing.T) {
 	// ": keep-alive" should be dropped completely
-	if res := normalizeSSEFrame([]byte(": keep-alive\n")); len(res) != 0 {
+	if res := normalizeSSEFrame(false, []byte(": keep-alive\n")); len(res) != 0 {
 		t.Fatalf("expected keep-alive to be dropped, got %q", string(res))
 	}
 	// "data: : keep-alive" should also be dropped
-	if res := normalizeSSEFrame([]byte("data: : keep-alive\n")); len(res) != 0 {
+	if res := normalizeSSEFrame(false, []byte("data: : keep-alive\n")); len(res) != 0 {
 		t.Fatalf("expected data keep-alive to be dropped, got %q", string(res))
 	}
 	// standard data chunk should be preserved as a complete SSE frame
 	validChunk := []byte("data: {\"choices\":[]}\n")
-	res := normalizeSSEFrame(validChunk)
+	res := normalizeSSEFrame(false, validChunk)
 	if string(res) != "data: {\"choices\":[]}\n\n" {
 		t.Fatalf("expected chunk to be preserved, got %q", string(res))
+	}
+}
+
+func TestNormalizeSSEFrameRawMode(t *testing.T) {
+	// Raw mode strips the "data: " prefix: the host applies SSE framing itself
+	// for chat-completions clients.
+	if res := normalizeSSEFrame(true, []byte("data: {\"choices\":[]}\n")); string(res) != "{\"choices\":[]}" {
+		t.Fatalf("raw data chunk = %q", string(res))
+	}
+	if res := normalizeSSEFrame(true, []byte("data: [DONE]\n")); string(res) != "[DONE]" {
+		t.Fatalf("raw [DONE] = %q", string(res))
+	}
+	// Event lines carry no data payload in raw mode.
+	if res := normalizeSSEFrame(true, []byte("event: response.completed\n")); len(res) != 0 {
+		t.Fatalf("raw event line = %q", string(res))
+	}
+	// Keep-alives stay dropped.
+	if res := normalizeSSEFrame(true, []byte(": keep-alive\n")); len(res) != 0 {
+		t.Fatalf("raw keep-alive = %q", string(res))
+	}
+}
+
+func TestSanitizeChatMessages(t *testing.T) {
+	root := map[string]any{
+		"messages": []any{
+			// roleless artifact (translated reasoning item): dropped
+			map[string]any{"role": nil},
+			// text part without a usable "text" field: dropped, content becomes ""
+			map[string]any{"role": "assistant", "content": []any{map[string]any{"type": "text"}}},
+			// null content normalized to ""
+			map[string]any{"role": "assistant", "content": nil},
+			// valid parts are kept, output_text normalized, annotations dropped
+			map[string]any{"role": "user", "content": []any{
+				map[string]any{"type": "output_text", "text": "hello", "annotations": []any{}},
+			}},
+			// string content untouched
+			map[string]any{"role": "user", "content": "hi"},
+		},
+	}
+	sanitizeChatMessages(root)
+	messages, _ := root["messages"].([]any)
+	if len(messages) != 4 {
+		t.Fatalf("messages = %v", messages)
+	}
+	first := messages[0].(map[string]any)
+	if first["content"] != "" {
+		t.Fatalf("textless part should leave empty content, got %v", first["content"])
+	}
+	second := messages[1].(map[string]any)
+	if second["content"] != "" {
+		t.Fatalf("null content should become empty string, got %v", second["content"])
+	}
+	third := messages[2].(map[string]any)
+	parts, _ := third["content"].([]any)
+	part, _ := parts[0].(map[string]any)
+	if part["type"] != "text" || part["text"] != "hello" {
+		t.Fatalf("normalized part = %v", part)
+	}
+	if _, exists := part["annotations"]; exists {
+		t.Fatal("annotations should be dropped")
+	}
+	if messages[3].(map[string]any)["content"] != "hi" {
+		t.Fatalf("string content should be untouched, got %v", messages[3])
+	}
+}
+
+func TestPrepareUpstreamBodyDropsReasoningItems(t *testing.T) {
+	resetConfig(t, testConfig())
+	body, _ := json.Marshal(map[string]any{
+		"model": "mimo-v2.6-flash-free",
+		"input": []any{
+			map[string]any{"role": "user", "content": []any{map[string]any{"type": "input_text", "text": "hello"}}},
+			map[string]any{
+				"id":               "rs_gen-test",
+				"type":             "reasoning",
+				"encrypted_content": "",
+				"summary":          []any{map[string]any{"type": "summary_text", "text": "thinking"}},
+			},
+			map[string]any{"type": "message", "role": "assistant", "content": []any{map[string]any{"type": "output_text", "text": "hi there", "annotations": []any{}}}},
+			map[string]any{"role": "user", "content": []any{map[string]any{"type": "input_text", "text": "reply one word"}}},
+		},
+	})
+	req := executorRequest{Model: "mimo-v2.6-flash-free", Payload: body}
+	route, _ := routeForModel(testConfig(), "mimo-v2.6-flash-free")
+	out, err := prepareUpstreamBody(req, route)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var root map[string]any
+	json.Unmarshal(out, &root)
+	messages, _ := root["messages"].([]any)
+	// user + assistant + user: no roleless reasoning artifact may survive
+	if len(messages) != 3 {
+		t.Fatalf("messages = %v", messages)
+	}
+	for _, m := range messages {
+		msg, _ := m.(map[string]any)
+		if role, _ := msg["role"].(string); strings.TrimSpace(role) == "" {
+			t.Fatalf("roleless message survived: %v", msg)
+		}
+		content, _ := msg["content"].([]any)
+		for _, p := range content {
+			part, _ := p.(map[string]any)
+			if part["type"] == "text" {
+				if text, _ := part["text"].(string); strings.TrimSpace(text) == "" {
+					t.Fatalf("textless part survived: %v", part)
+				}
+			}
+		}
 	}
 }
 
@@ -1007,7 +1167,7 @@ func TestLineBufferReassembly(t *testing.T) {
 			copy(line, data[:idx])
 			lineBuf.Next(idx + 1)
 
-			if s := normalizeSSEFrame(line); len(s) > 0 {
+			if s := normalizeSSEFrame(false, line); len(s) > 0 {
 				emitted = append(emitted, s)
 			}
 		}
