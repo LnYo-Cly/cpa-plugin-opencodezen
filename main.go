@@ -1055,6 +1055,9 @@ func prepareUpstreamBody(req executorRequest, route modelRoute) ([]byte, error) 
 	if route.Model != "" {
 		root["model"] = route.Model
 	}
+	if err := convertBodyDialect(root, route.Endpoint); err != nil {
+		return nil, err
+	}
 	root["stream"] = true
 
 	dialect, known := bodyDialect(root)
@@ -1067,6 +1070,230 @@ func prepareUpstreamBody(req executorRequest, route modelRoute) ([]byte, error) 
 		return nil, err
 	}
 	return out, nil
+}
+
+// convertBodyDialect converts a host-translated request between the
+// chat-completions and responses payload shapes. CPA may hand us either
+// format regardless of the endpoint a model requires, so the upstream body
+// must always match route.Endpoint.
+func convertBodyDialect(root map[string]any, endpoint string) error {
+	dialect, known := bodyDialect(root)
+	if !known || dialect == endpoint {
+		return nil
+	}
+	if endpoint == "chat" {
+		return responsesToChat(root)
+	}
+	return chatToResponses(root)
+}
+
+func responsesToChat(root map[string]any) error {
+	input, ok := root["input"]
+	if !ok {
+		return nil
+	}
+	delete(root, "input")
+
+	var messages []any
+	if instructions, ok := root["instructions"].(string); ok && strings.TrimSpace(instructions) != "" {
+		messages = append(messages, map[string]any{
+			"role":    "system",
+			"content": instructions,
+		})
+	}
+	delete(root, "instructions")
+
+	switch source := input.(type) {
+	case string:
+		messages = append(messages, map[string]any{"role": "user", "content": source})
+	case []any:
+		for _, item := range source {
+			entry, ok := item.(map[string]any)
+			if !ok {
+				continue
+			}
+			message := map[string]any{"role": entry["role"]}
+			if content, ok := entry["content"]; ok {
+				message["content"] = normalizeResponsesContent(content)
+			}
+			messages = append(messages, message)
+		}
+	default:
+		return fmt.Errorf("zen executor: unsupported responses input shape")
+	}
+	if len(messages) == 0 {
+		return fmt.Errorf("zen executor: responses input is empty")
+	}
+	root["messages"] = messages
+
+	if tools, ok := root["tools"].([]any); ok {
+		root["tools"] = responsesToolsToChat(tools)
+	}
+	if text, ok := root["text"].(map[string]any); ok {
+		if format, ok := text["format"]; ok {
+			root["response_format"] = format
+		}
+		delete(root, "text")
+	}
+	return nil
+}
+
+func normalizeResponsesContent(content any) any {
+	parts, ok := content.([]any)
+	if !ok {
+		return content
+	}
+	out := make([]any, 0, len(parts))
+	changed := false
+	for _, item := range parts {
+		part, ok := item.(map[string]any)
+		if !ok {
+			out = append(out, item)
+			continue
+		}
+		if part["type"] == "input_text" || part["type"] == "output_text" {
+			converted := make(map[string]any, len(part))
+			for k, v := range part {
+				if k == "type" {
+					converted[k] = "text"
+				} else {
+					converted[k] = v
+				}
+			}
+			out = append(out, converted)
+			changed = true
+			continue
+		}
+		out = append(out, part)
+	}
+	if !changed {
+		return content
+	}
+	return out
+}
+
+func responsesToolsToChat(tools []any) []any {
+	out := make([]any, 0, len(tools))
+	for _, item := range tools {
+		tool, ok := item.(map[string]any)
+		if !ok {
+			out = append(out, item)
+			continue
+		}
+		if _, ok := tool["function"].(map[string]any); ok {
+			out = append(out, tool)
+			continue
+		}
+		name, _ := tool["name"].(string)
+		if name == "" {
+			out = append(out, tool)
+			continue
+		}
+		fn, ok := tool["function"].(map[string]any)
+		if !ok {
+			fn = make(map[string]any, len(tool))
+			for k, v := range tool {
+				if k == "type" {
+					continue
+				}
+				fn[k] = v
+			}
+		}
+		converted := map[string]any{"type": "function", "function": fn}
+		out = append(out, converted)
+	}
+	return out
+}
+
+func chatToResponses(root map[string]any) error {
+	source, ok := root["messages"].([]any)
+	if !ok {
+		return nil
+	}
+	delete(root, "messages")
+
+	input := make([]any, 0, len(source))
+	for _, item := range source {
+		entry, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		message := map[string]any{"role": entry["role"]}
+		if content, ok := entry["content"]; ok {
+			message["content"] = normalizeChatContent(content)
+		}
+		input = append(input, message)
+	}
+	if len(input) == 0 {
+		return fmt.Errorf("zen executor: chat messages are empty")
+	}
+	root["input"] = input
+
+	if tools, ok := root["tools"].([]any); ok {
+		root["tools"] = chatToolsToResponses(tools)
+	}
+	if format, ok := root["response_format"]; ok {
+		root["text"] = map[string]any{"format": format}
+		delete(root, "response_format")
+	}
+	return nil
+}
+
+func normalizeChatContent(content any) any {
+	parts, ok := content.([]any)
+	if !ok {
+		return content
+	}
+	out := make([]any, 0, len(parts))
+	changed := false
+	for _, item := range parts {
+		part, ok := item.(map[string]any)
+		if !ok {
+			out = append(out, item)
+			continue
+		}
+		if part["type"] == "text" {
+			converted := make(map[string]any, len(part))
+			for k, v := range part {
+				if k == "type" {
+					converted[k] = "input_text"
+				} else {
+					converted[k] = v
+				}
+			}
+			out = append(out, converted)
+			changed = true
+			continue
+		}
+		out = append(out, part)
+	}
+	if !changed {
+		return content
+	}
+	return out
+}
+
+func chatToolsToResponses(tools []any) []any {
+	out := make([]any, 0, len(tools))
+	for _, item := range tools {
+		tool, ok := item.(map[string]any)
+		if !ok {
+			out = append(out, item)
+			continue
+		}
+		fn, ok := tool["function"].(map[string]any)
+		if !ok {
+			out = append(out, tool)
+			continue
+		}
+		converted := make(map[string]any, len(fn)+1)
+		for k, v := range fn {
+			converted[k] = v
+		}
+		converted["type"] = "function"
+		out = append(out, converted)
+	}
+	return out
 }
 
 func bodyDialect(root map[string]any) (string, bool) {
@@ -1619,8 +1846,8 @@ type toolCallDelta struct {
 func foldResponsesSSE(sse []byte) ([]byte, error) {
 	var (
 		id, model, status string
-		output             []json.RawMessage
-		usage              json.RawMessage
+		output            []json.RawMessage
+		usage             json.RawMessage
 	)
 	for _, frame := range sseFrames(sse) {
 		if frame == "[DONE]" {

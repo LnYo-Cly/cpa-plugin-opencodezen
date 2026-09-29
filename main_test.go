@@ -266,9 +266,9 @@ func TestAuthParseFromFilePayload(t *testing.T) {
 
 	// Scenario 1: User creates a zen auth file with provider="zen"
 	payload, _ := json.Marshal(map[string]any{
-		"Provider": "zen",
-		"StorageJSON": []byte(`{"provider":"zen","api_key":"sk-opencode-secret-123","base_url":"https://opencode.ai/zen/v1"}`),
-		"FileName": "zen-test.json",
+		"Provider":    "zen",
+		"StorageJSON": json.RawMessage(`{"provider":"zen","api_key":"sk-opencode-secret-123","base_url":"https://opencode.ai/zen/v1"}`),
+		"FileName":    "zen-test.json",
 	})
 	out, err := handleMethod("auth.parse", payload)
 	if err != nil {
@@ -291,8 +291,8 @@ func TestAuthParseFromFilePayload(t *testing.T) {
 
 	// Scenario 2: User creates an auth file where type="zen"
 	payload2, _ := json.Marshal(map[string]any{
-		"StorageJSON": []byte(`{"type":"zen","key":"sk-opencode-secret-456"}`),
-		"FileName": "my-zen-key.json",
+		"StorageJSON": json.RawMessage(`{"type":"zen","key":"sk-opencode-secret-456"}`),
+		"FileName":    "my-zen-key.json",
 	})
 	out2, err := handleMethod("auth.parse", payload2)
 	if err != nil {
@@ -475,9 +475,9 @@ func TestResolveSessionInvalidCharsFailsClosed(t *testing.T) {
 func TestGateHeadersIncludesRequiredFields(t *testing.T) {
 	resetConfig(t, testConfig())
 	req := executorRequest{
-		Model:   "mimo-v2.6-flash-free",
-		Payload: chatPayload("mimo-v2.6-flash-free", "hello"),
-		Headers: map[string][]string{"Session-Id": {"s1"}},
+		Model:    "mimo-v2.6-flash-free",
+		Payload:  chatPayload("mimo-v2.6-flash-free", "hello"),
+		Headers:  map[string][]string{"Session-Id": {"s1"}},
 		Metadata: map[string]any{"request_id": "exec-1"},
 	}
 	h := gateHeaders(req)
@@ -625,6 +625,109 @@ func TestPrepareUpstreamBodyInjectsTools(t *testing.T) {
 	tools, _ := root["tools"].([]any)
 	if len(tools) < 2 {
 		t.Fatalf("tools = %v, want >= 2", tools)
+	}
+}
+
+func TestPrepareUpstreamBodyConvertsResponsesToChat(t *testing.T) {
+	resetConfig(t, testConfig())
+	body, _ := json.Marshal(map[string]any{
+		"model":        "mimo-v2.6-flash-free",
+		"instructions": "You are helpful.",
+		"input": []any{map[string]any{
+			"role": "user",
+			"content": []any{map[string]any{
+				"type": "input_text",
+				"text": "hello",
+			}},
+		}},
+		"tools": []any{map[string]any{
+			"type":        "function",
+			"name":        "bash",
+			"description": "Runs a shell.",
+			"parameters":  map[string]any{"type": "object"},
+		}},
+	})
+	req := executorRequest{Model: "mimo-v2.6-flash-free", Payload: body}
+	route, _ := routeForModel(testConfig(), "mimo-v2.6-flash-free")
+	out, err := prepareUpstreamBody(req, route)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var root map[string]any
+	json.Unmarshal(out, &root)
+	if _, exists := root["input"]; exists {
+		t.Fatal("input was not converted to messages")
+	}
+	messages, _ := root["messages"].([]any)
+	if len(messages) != 2 {
+		t.Fatalf("messages = %v", messages)
+	}
+	first := messages[0].(map[string]any)
+	if first["role"] != "system" || first["content"] != "You are helpful." {
+		t.Fatalf("system message = %v", first)
+	}
+	second := messages[1].(map[string]any)
+	parts, _ := second["content"].([]any)
+	part, _ := parts[0].(map[string]any)
+	if part["type"] != "text" || part["text"] != "hello" {
+		t.Fatalf("converted content = %v", second["content"])
+	}
+	tools, _ := root["tools"].([]any)
+	if len(tools) != 2 {
+		t.Fatalf("tools = %v, want existing bash plus appended read", tools)
+	}
+	bash, _ := tools[0].(map[string]any)
+	fn, _ := bash["function"].(map[string]any)
+	if fn["name"] != "bash" {
+		t.Fatalf("bash tool was not converted to chat format: %v", bash)
+	}
+}
+
+func TestPrepareUpstreamBodyConvertsChatToResponses(t *testing.T) {
+	resetConfig(t, testConfig())
+	body, _ := json.Marshal(map[string]any{
+		"model": "muse-spark-1.3-contributor-free",
+		"messages": []any{map[string]any{
+			"role": "user",
+			"content": []any{map[string]any{
+				"type": "text",
+				"text": "hello",
+			}},
+		}},
+		"tools": []any{map[string]any{
+			"type": "function",
+			"function": map[string]any{
+				"name":        "bash",
+				"description": "Runs a shell.",
+				"parameters":  map[string]any{"type": "object"},
+			},
+		}},
+	})
+	req := executorRequest{Model: "muse-spark-1.3-contributor-free", Payload: body}
+	route, _ := routeForModel(testConfig(), "muse-spark-1.3-contributor-free")
+	out, err := prepareUpstreamBody(req, route)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var root map[string]any
+	json.Unmarshal(out, &root)
+	if _, exists := root["messages"]; exists {
+		t.Fatal("messages were not converted to input")
+	}
+	input, _ := root["input"].([]any)
+	message, _ := input[0].(map[string]any)
+	parts, _ := message["content"].([]any)
+	part, _ := parts[0].(map[string]any)
+	if part["type"] != "input_text" || part["text"] != "hello" {
+		t.Fatalf("converted content = %v", message["content"])
+	}
+	tools, _ := root["tools"].([]any)
+	if len(tools) != 2 {
+		t.Fatalf("tools = %v, want existing bash plus appended read", tools)
+	}
+	bash, _ := tools[0].(map[string]any)
+	if bash["name"] != "bash" {
+		t.Fatalf("bash tool was not converted to responses format: %v", bash)
 	}
 }
 
@@ -819,7 +922,7 @@ func TestProcessPluginCallInvalidJSON(t *testing.T) {
 
 func TestExecuteUnknownModel(t *testing.T) {
 	resetConfig(t, testConfig())
-	body, _ := json.Marshal(executorRequest{Model: "nonexistent-model", Payload: chatPayload("nonexistent-model", "hi")})
+	body, _ := json.Marshal(executorRequest{Model: "", Payload: chatPayload("nonexistent-model", "hi")})
 	_, err := execute(body, false)
 	if err == nil || !strings.Contains(err.Error(), "no model") {
 		t.Fatalf("error = %v", err)
@@ -858,9 +961,9 @@ func TestStripSSEPayloadDropsKeepAlivesAndComments(t *testing.T) {
 func TestAuthParseExtractsModelsList(t *testing.T) {
 	resetConfig(t, pluginConfig{Enabled: true, Provider: "zen"})
 	payload, _ := json.Marshal(map[string]any{
-		"Provider": "zen",
-		"StorageJSON": []byte(`{"provider":"zen","api_key":"sk-test","models":[{"name":"custom-model"}]}`),
-		"FileName": "zen-custom.json",
+		"Provider":    "zen",
+		"StorageJSON": json.RawMessage(`{"provider":"zen","api_key":"sk-test","models":[{"name":"custom-model"}]}`),
+		"FileName":    "zen-custom.json",
 	})
 	out, err := handleMethod("auth.parse", payload)
 	if err != nil {
