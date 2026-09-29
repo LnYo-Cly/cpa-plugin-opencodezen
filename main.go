@@ -416,7 +416,7 @@ type executorResponse struct {
 
 type executorStreamResponse struct {
 	Headers map[string][]string `json:"headers,omitempty"`
-	Chunks  []streamChunk      `json:"chunks,omitempty"`
+	Chunks  []streamChunk       `json:"chunks,omitempty"`
 }
 
 type streamChunk struct {
@@ -525,7 +525,7 @@ func handleMethod(method string, payload []byte) ([]byte, error) {
 				Executor:              true,
 				ExecutorModelScope:    "both",
 				ExecutorInputFormats:  []string{"chat-completions", "responses"},
-				ExecutorOutputFormats: []string{"chat-completions", "responses"},
+				ExecutorOutputFormats: []string{"chat-completions"},
 				ModelRegistrar:        true,
 				AuthProvider:          true,
 			},
@@ -1656,47 +1656,40 @@ func readHostStream(streamID string) (httpStreamChunk, error) {
 
 // emitStreamChunk forwards one payload frame through the plugin stream bridge.
 func emitStreamChunk(streamID string, payload []byte) error {
-	stripped := stripSSEPayload(payload)
-	if len(stripped) == 0 {
+	frame := normalizeSSEFrame(payload)
+	if len(frame) == 0 {
 		return nil
 	}
 	_, err := callHost("host.stream.emit", map[string]any{
 		"stream_id": streamID,
-		"payload":   stripped,
+		"payload":   frame,
 	})
 	return err
 }
 
-// stripSSEPayload removes SSE "data:" prefixes, ignores SSE comments / keep-alives
-// (lines starting with ':'), and cleans surrounding whitespace from a raw upstream
-// SSE line so the host bridge can reapply its own "data:" prefix cleanly.
-func stripSSEPayload(raw []byte) []byte {
+// normalizeSSEFrame keeps complete SSE fields intact. The host response
+// translator expects chat-completions SSE frames, including event and data
+// lines; stripping those fields makes /v1/responses see an empty stream.
+func normalizeSSEFrame(raw []byte) []byte {
 	s := strings.TrimSpace(string(raw))
-	if s == "" {
+	if s == "" || strings.HasPrefix(s, ":") {
 		return nil
 	}
-	// Drop SSE comments / keep-alives like ": keep-alive", ": ping", ":"
-	if strings.HasPrefix(s, ":") {
-		return nil
+	if s == "[DONE]" {
+		return []byte("data: [DONE]\n\n")
 	}
-	// Handle "data: [DONE]"
-	if s == "data: [DONE]" || s == "[DONE]" {
-		return []byte("[DONE]\n")
-	}
-	// Handle "data: {...}" single-line frames.
 	if after, ok := strings.CutPrefix(s, "data:"); ok {
 		after = strings.TrimLeft(after, " \t")
 		if after == "" || strings.HasPrefix(after, ":") {
 			return nil
 		}
-		if after == "[DONE]" {
-			return []byte("[DONE]\n")
-		}
-		return []byte(after + "\n")
+		return []byte(s + "\n\n")
 	}
-	// If it doesn't have "data:" prefix (rare in raw stream), ensure valid JSON object
+	if strings.HasPrefix(s, "event:") || strings.HasPrefix(s, "id:") || strings.HasPrefix(s, "retry:") {
+		return []byte(s + "\n\n")
+	}
 	if strings.HasPrefix(s, "{") && strings.HasSuffix(s, "}") {
-		return []byte(s + "\n")
+		return []byte("data: " + s + "\n\n")
 	}
 	return nil
 }

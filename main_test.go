@@ -16,6 +16,13 @@ func resetConfig(t *testing.T, cfg pluginConfig) {
 	t.Cleanup(func() { storeConfig(defaultPluginConfig()) })
 }
 
+func TestNormalizeSSEFramePreservesEventLine(t *testing.T) {
+	res := normalizeSSEFrame([]byte("event: response.completed\n"))
+	if string(res) != "event: response.completed\n\n" {
+		t.Fatalf("event line = %q", string(res))
+	}
+}
+
 func testConfig() pluginConfig {
 	return pluginConfig{
 		Enabled:  true,
@@ -941,19 +948,19 @@ func TestExecuteStreamRequiresStreamID(t *testing.T) {
 	_ = route
 }
 
-func TestStripSSEPayloadDropsKeepAlivesAndComments(t *testing.T) {
+func TestNormalizeSSEFrameDropsKeepAlivesAndComments(t *testing.T) {
 	// ": keep-alive" should be dropped completely
-	if res := stripSSEPayload([]byte(": keep-alive\n")); len(res) != 0 {
+	if res := normalizeSSEFrame([]byte(": keep-alive\n")); len(res) != 0 {
 		t.Fatalf("expected keep-alive to be dropped, got %q", string(res))
 	}
 	// "data: : keep-alive" should also be dropped
-	if res := stripSSEPayload([]byte("data: : keep-alive\n")); len(res) != 0 {
+	if res := normalizeSSEFrame([]byte("data: : keep-alive\n")); len(res) != 0 {
 		t.Fatalf("expected data keep-alive to be dropped, got %q", string(res))
 	}
-	// standard data chunk should be preserved with data: stripped
+	// standard data chunk should be preserved as a complete SSE frame
 	validChunk := []byte("data: {\"choices\":[]}\n")
-	res := stripSSEPayload(validChunk)
-	if string(res) != "{\"choices\":[]}\n" {
+	res := normalizeSSEFrame(validChunk)
+	if string(res) != "data: {\"choices\":[]}\n\n" {
 		t.Fatalf("expected chunk to be preserved, got %q", string(res))
 	}
 }
@@ -1000,7 +1007,7 @@ func TestLineBufferReassembly(t *testing.T) {
 			copy(line, data[:idx])
 			lineBuf.Next(idx + 1)
 
-			if s := stripSSEPayload(line); len(s) > 0 {
+			if s := normalizeSSEFrame(line); len(s) > 0 {
 				emitted = append(emitted, s)
 			}
 		}
@@ -1018,10 +1025,10 @@ func TestLineBufferReassembly(t *testing.T) {
 		t.Fatalf("expected 2 emitted frames, got %d: %v", len(emitted), emitted)
 	}
 
-	if string(emitted[0]) != "{\"id\":\"123\",\"content\":\"hello\"}\n" {
+	if string(emitted[0]) != "data: {\"id\":\"123\",\"content\":\"hello\"}\n\n" {
 		t.Fatalf("unexpected line 0: %q", string(emitted[0]))
 	}
-	if string(emitted[1]) != "[DONE]\n" {
+	if string(emitted[1]) != "data: [DONE]\n\n" {
 		t.Fatalf("unexpected line 1: %q", string(emitted[1]))
 	}
 }
