@@ -87,7 +87,7 @@ const (
 	defaultUserAgent = "opencode/1.18.31 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14"
 )
 
-var pluginVersion = "0.4.2"
+var pluginVersion = "0.5.0"
 
 var (
 	canonicalSessionRe = regexp.MustCompile(`^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$`)
@@ -1019,11 +1019,14 @@ func runStream(req executorRequest, cfg pluginConfig, route modelRoute, endpoint
 		return
 	}
 
-	// Chat-completions clients get their SSE framing applied by the host
-	// itself; emitting pre-framed "data: ..." lines there produces doubled
-	// prefixes. Responses clients go through the host response
-	// translator, which expects complete SSE frames.
-	rawData := strings.Contains(strings.ToLower(strings.TrimSpace(req.SourceFormat)), "chat")
+	// Chat-completions clients (SourceFormat "openai" / "chat-completions") get
+	// their SSE framing applied by the host itself: when outputFormat equals the
+	// requested format the host passes plugin chunks through verbatim and the
+	// handler writes the "data: " prefix, so pre-framed lines would double it.
+	// Responses/claude/gemini clients go through TranslateStream, whose
+	// translators expect "data:" framed input and strip the prefix themselves.
+	src := strings.ToLower(strings.TrimSpace(req.SourceFormat))
+	rawData := src == "openai" || strings.Contains(src, "chat")
 
 	var lineBuf bytes.Buffer
 	for {
