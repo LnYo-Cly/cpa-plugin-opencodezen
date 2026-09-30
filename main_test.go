@@ -2,9 +2,13 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 )
 
 var canonicalShapeRe = regexp.MustCompile(`^(ses|msg)_[0-9a-f]{12}[0-9A-Za-z]{14}$`)
@@ -1465,5 +1469,61 @@ func TestResponsesToolsToChatStripsNullFields(t *testing.T) {
 		if _, ok := fn["strict"]; ok {
 			t.Fatalf("strict survived conversion: %v", fn)
 		}
+	}
+}
+
+func TestFetchZenModelsFiltersFreeTier(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/models" {
+			http.NotFound(w, r)
+			return
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer k1" {
+			t.Errorf("auth header = %q", got)
+		}
+		fmt.Fprint(w, `{"object":"list","data":[{"id":"mimo-v2.6-flash-free"},{"id":"claude-opus-5"},{"id":"muse-spark-1.3-contributor-free"}]}`)
+	}))
+	defer srv.Close()
+	ids, err := fetchZenModels(srv.URL, "k1")
+	if err != nil {
+		t.Fatalf("fetchZenModels: %v", err)
+	}
+	if len(ids) != 2 || ids[0] != "mimo-v2.6-flash-free" || ids[1] != "muse-spark-1.3-contributor-free" {
+		t.Fatalf("ids = %v", ids)
+	}
+}
+
+func TestModelRegistrationMergesDiscoveredModels(t *testing.T) {
+	discoveredModels.mu.Lock()
+	discoveredModels.ids = []string{"mimo-v2.6-flash-free", "jev-1.13-free"}
+	discoveredModels.fetchedAt = time.Now()
+	discoveredModels.mu.Unlock()
+	defer func() {
+		discoveredModels.mu.Lock()
+		discoveredModels.ids, discoveredModels.fetchedAt = nil, time.Time{}
+		discoveredModels.mu.Unlock()
+	}()
+
+	out, err := modelRegistration()
+	if err != nil {
+		t.Fatalf("modelRegistration: %v", err)
+	}
+	var resp struct {
+		Result struct {
+			Models []struct{ ID string `json:"id"` } `json:"models"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(out, &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	seen := map[string]bool{}
+	for _, m := range resp.Result.Models {
+		seen[m.ID] = true
+	}
+	if !seen["jev-1.13-free"] {
+		t.Fatalf("discovered model missing: %v", seen)
+	}
+	if len(resp.Result.Models) != len(defaultZenModels)+1 {
+		t.Fatalf("model count = %d, want %d (defaults + 1 new)", len(resp.Result.Models), len(defaultZenModels)+1)
 	}
 }

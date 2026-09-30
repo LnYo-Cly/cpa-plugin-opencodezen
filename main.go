@@ -59,6 +59,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"regexp"
 	"strings"
@@ -88,7 +89,7 @@ const (
 	defaultUserAgent = "opencode/1.18.31 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14"
 )
 
-var pluginVersion = "0.6.1"
+var pluginVersion = "0.7.0"
 
 var (
 	canonicalSessionRe = regexp.MustCompile(`^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$`)
@@ -358,6 +359,40 @@ func inferEndpoint(model string) string {
 	return "chat"
 }
 
+// learnedEndpoints records upstream endpoints discovered by retrying a
+// failed chat request against /responses (models zen only serves there).
+var learnedEndpoints struct {
+	mu sync.RWMutex
+	m  map[string]string
+}
+
+func rememberEndpoint(model, endpoint string) {
+	learnedEndpoints.mu.Lock()
+	defer learnedEndpoints.mu.Unlock()
+	if learnedEndpoints.m == nil {
+		learnedEndpoints.m = map[string]string{}
+	}
+	learnedEndpoints.m[strings.ToLower(strings.TrimSpace(model))] = endpoint
+}
+
+func learnedEndpoint(model string) (string, bool) {
+	learnedEndpoints.mu.RLock()
+	defer learnedEndpoints.mu.RUnlock()
+	ep, ok := learnedEndpoints.m[strings.ToLower(strings.TrimSpace(model))]
+	return ep, ok
+}
+
+// routeConfigured reports whether the model has an explicit entry in plugin
+// config; learned-endpoint retries never override explicit configuration.
+func routeConfigured(cfg pluginConfig, model string) bool {
+	for _, m := range cfg.Models {
+		if strings.EqualFold(m.Model, model) || strings.EqualFold(m.Alias, model) {
+			return true
+		}
+	}
+	return false
+}
+
 // routeForModel resolves the route for a requested model id.
 // It checks explicit plugin configuration first; if none match, it automatically
 // infers the route so any model added in openai-compatibility works out of the box.
@@ -371,12 +406,17 @@ func routeForModel(cfg pluginConfig, model string) (modelRoute, bool) {
 			return m, true
 		}
 	}
-	// Fallback to intelligent inference
-	return modelRoute{
+	// Fallback to intelligent inference, refined by endpoints learned from
+	// live 400-retries (chat → responses).
+	r := modelRoute{
 		Model:    model,
 		Alias:    model,
 		Endpoint: inferEndpoint(model),
-	}, true
+	}
+	if ep, ok := learnedEndpoint(model); ok {
+		r.Endpoint = ep
+	}
+	return r, true
 }
 
 // ---------------------------------------------------------------------------
@@ -637,10 +677,11 @@ func authParse(payload []byte) ([]byte, error) {
 				pName := extractProvider(stored, req.Provider)
 
 				// If the file explicitly mentions zen, or if the host identifies it as zen,
-				// or if it matches any configured api-key:
+				// or if it matches any configured api-key. Filename/ID only need the
+				// provider prefix so zen.json, zen1.json, zen-abc.json all match.
 				isZen := strings.EqualFold(pName, cfg.Provider) ||
-					strings.HasPrefix(strings.ToLower(req.FileName), cfg.Provider+"-") ||
-					strings.HasPrefix(strings.ToLower(req.ID), cfg.Provider+"-")
+					strings.HasPrefix(strings.ToLower(req.FileName), cfg.Provider) ||
+					strings.HasPrefix(strings.ToLower(req.ID), cfg.Provider)
 
 				if !isZen && key != "" {
 					for _, k := range cfg.APIKeys {
@@ -652,6 +693,10 @@ func authParse(payload []byte) ([]byte, error) {
 				}
 
 				if isZen && key != "" {
+					// Remember the key so model discovery can query /models, and
+					// refresh the discovered free-tier list in the background.
+					rememberAuthKey(key)
+					go refreshDiscoveredModels(authBaseURL(stored, cfg), key)
 					id := sha256Prefix(key)
 					fileName := req.FileName
 					if fileName == "" {
@@ -816,14 +861,161 @@ func resolveModelCapabilities(m modelRoute) modelCapabilities {
 	return caps
 }
 
+// discoveredZenModels returns the cached free-tier model IDs fetched from
+// the zen /models endpoint, refreshing synchronously (at most once per TTL)
+// when a key is known. Discovery failures silently fall back to the cache.
+var discoveredModels struct {
+	mu        sync.RWMutex
+	ids       []string
+	fetchedAt time.Time
+}
+
+// seenAuthKeys accumulates zen API keys observed by auth.parse; discovery
+// needs one to query /models.
+var seenAuthKeys struct {
+	mu   sync.Mutex
+	keys []string
+}
+
+func rememberAuthKey(key string) {
+	if strings.TrimSpace(key) == "" {
+		return
+	}
+	seenAuthKeys.mu.Lock()
+	defer seenAuthKeys.mu.Unlock()
+	for _, k := range seenAuthKeys.keys {
+		if k == key {
+			return
+		}
+	}
+	seenAuthKeys.keys = append(seenAuthKeys.keys, key)
+}
+
+func anyKnownKey(cfg pluginConfig) string {
+	if len(cfg.APIKeys) > 0 {
+		return cfg.APIKeys[0]
+	}
+	seenAuthKeys.mu.Lock()
+	defer seenAuthKeys.mu.Unlock()
+	if len(seenAuthKeys.keys) > 0 {
+		return seenAuthKeys.keys[0]
+	}
+	return ""
+}
+
+// authBaseURL picks the base URL for discovery: the auth file's custom
+// service address if present, else plugin config, else the zen default.
+func authBaseURL(stored map[string]any, cfg pluginConfig) string {
+	for _, field := range []string{"base_url", "url"} {
+		if v, ok := stored[field].(string); ok {
+			if u := strings.TrimRight(strings.TrimSpace(v), "/"); u != "" {
+				return u
+			}
+		}
+	}
+	if cfg.BaseURL != "" {
+		return cfg.BaseURL
+	}
+	return zenBaseURL
+}
+
+// fetchZenModels lists free-tier model IDs from the zen /models endpoint.
+// ponytail: plain http.Client instead of host.http.do — model.register has no
+// host callback context; add host-routed discovery if proxy support matters.
+func fetchZenModels(baseURL, apiKey string) ([]string, error) {
+	client := &http.Client{Timeout: 10 * time.Second}
+	req, err := http.NewRequest(http.MethodGet, baseURL+"/models", nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("zen /models status %d: %s", resp.StatusCode, truncate(body, 256))
+	}
+	var list struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &list); err != nil {
+		return nil, err
+	}
+	ids := make([]string, 0, len(list.Data))
+	for _, m := range list.Data {
+		if id := strings.TrimSpace(m.ID); id != "" && strings.HasSuffix(strings.ToLower(id), "-free") {
+			ids = append(ids, id)
+		}
+	}
+	return ids, nil
+}
+
+// refreshDiscoveredModels updates the discovery cache (best effort).
+func refreshDiscoveredModels(baseURL, apiKey string) {
+	ids, err := fetchZenModels(baseURL, apiKey)
+	if err != nil {
+		return
+	}
+	discoveredModels.mu.Lock()
+	discoveredModels.ids, discoveredModels.fetchedAt = ids, time.Now()
+	discoveredModels.mu.Unlock()
+}
+
+// discoveredZenModels returns the cached free-tier IDs, refreshing the cache
+// synchronously at most once per TTL when a key is known.
+func discoveredZenModels(cfg pluginConfig) []string {
+	discoveredModels.mu.RLock()
+	fresh := time.Since(discoveredModels.fetchedAt) < 10*time.Minute
+	ids := discoveredModels.ids
+	discoveredModels.mu.RUnlock()
+	if fresh {
+		return ids
+	}
+	key := anyKnownKey(cfg)
+	if key == "" {
+		return ids
+	}
+	baseURL := cfg.BaseURL
+	if baseURL == "" {
+		baseURL = zenBaseURL
+	}
+	refreshDiscoveredModels(baseURL, key)
+	discoveredModels.mu.RLock()
+	defer discoveredModels.mu.RUnlock()
+	return discoveredModels.ids
+}
+
 // modelRegistration announces supported Zen models to CPA.
 // If the user configured custom models in plugins.configs.zen, it announces those;
-// otherwise it announces the default set of Zen free-tier models.
+// otherwise it announces the default set of Zen free-tier models plus any
+// free-tier models discovered live from the zen /models endpoint.
 func modelRegistration() ([]byte, error) {
 	cfg := loadedConfig()
 	declared := cfg.Models
 	if len(declared) == 0 {
 		declared = defaultZenModels
+		for _, id := range discoveredZenModels(cfg) {
+			dup := false
+			for _, m := range declared {
+				if strings.EqualFold(m.Model, id) {
+					dup = true
+					break
+				}
+			}
+			if !dup {
+				// Endpoint is a guess; the 400-retry in execute()/runStream()
+				// self-corrects chat vs responses per model.
+				declared = append(declared, modelRoute{Model: id, Alias: id, Endpoint: inferEndpoint(id)})
+			}
+		}
 	}
 	models := make([]modelInfo, 0, len(declared))
 	for _, m := range declared {
@@ -891,29 +1083,59 @@ func execute(payload []byte, stream bool) ([]byte, error) {
 	}
 
 	baseURL := baseURLForRequest(req, cfg)
-
-	// Gate rule 4: zen only answers streaming requests. For non-streaming
-	// clients we still stream upstream and fold the SSE answer below.
-	upstreamBody, err := prepareUpstreamBody(req, route)
-	if err != nil {
-		return nil, err
-	}
 	headers := gateHeaders(req)
-	endpointURL := baseURL + route.EndpointPath()
 
 	if !stream {
-		body, respHeaders, status, err := doUpstream(req.HostCallbackID, http.MethodPost, endpointURL, headers, apiKey, upstreamBody)
+		return executeNonStream(req, cfg, route, baseURL, headers, apiKey)
+	}
+
+	streamID := strings.TrimSpace(req.StreamID)
+	if streamID == "" {
+		return nil, fmt.Errorf("stream_id is required for executor.execute_stream")
+	}
+	go runStream(req, cfg, route, baseURL, headers, apiKey, streamID)
+	return okEnvelopeJSON(executorStreamResponse{
+		Headers: map[string][]string{"Content-Type": {"text/event-stream"}},
+	})
+}
+
+// executeNonStream streams from zen and folds the SSE answer into one JSON
+// payload. When the model has no explicit endpoint config and /chat/completions
+// answers 400, it retries once against /responses and remembers the endpoint.
+func executeNonStream(req executorRequest, cfg pluginConfig, route modelRoute, baseURL string, headers map[string][]string, apiKey string) ([]byte, error) {
+	endpoints := []string{route.Endpoint}
+	if route.Endpoint == "chat" && !routeConfigured(cfg, route.Model) {
+		endpoints = append(endpoints, "responses")
+	}
+	var lastErr error
+	for _, ep := range endpoints {
+		r := route
+		r.Endpoint = ep
+		// Gate rule 4: zen only answers streaming requests; the SSE answer
+		// is folded below.
+		upstreamBody, err := prepareUpstreamBody(req, r)
+		if err != nil {
+			return nil, err
+		}
+		body, respHeaders, status, err := doUpstream(req.HostCallbackID, http.MethodPost, baseURL+r.EndpointPath(), headers, apiKey, upstreamBody)
 		if err != nil {
 			return nil, err
 		}
 		if status < 200 || status >= 300 {
-			return nil, fmt.Errorf("zen upstream status %d: %s", status, truncate(body, 512))
+			lastErr = fmt.Errorf("zen upstream status %d: %s", status, truncate(body, 512))
+			if status == 400 && ep == "chat" && len(endpoints) > 1 {
+				continue // model may be responses-only upstream
+			}
+			return nil, lastErr
 		}
-		folded, err := foldSSEToJSON(body, route.Endpoint)
+		if ep != route.Endpoint {
+			rememberEndpoint(route.Model, ep)
+		}
+		folded, err := foldSSEToJSON(body, ep)
 		if err != nil {
 			return nil, err
 		}
-		if route.Endpoint == "responses" {
+		if ep == "responses" {
 			// The plugin declares chat-completions output, so the folded
 			// responses object must become a chat.completion before the host
 			// translates it for the requesting client.
@@ -924,15 +1146,7 @@ func execute(payload []byte, stream bool) ([]byte, error) {
 		}
 		return okEnvelopeJSON(executorResponse{Payload: folded, Headers: respHeaders})
 	}
-
-	streamID := strings.TrimSpace(req.StreamID)
-	if streamID == "" {
-		return nil, fmt.Errorf("stream_id is required for executor.execute_stream")
-	}
-	go runStream(req, cfg, route, endpointURL, headers, apiKey, upstreamBody, streamID)
-	return okEnvelopeJSON(executorStreamResponse{
-		Headers: map[string][]string{"Content-Type": {"text/event-stream"}},
-	})
+	return nil, lastErr
 }
 
 // baseURLForRequest resolves the upstream base URL. It checks the host-selected
@@ -983,7 +1197,7 @@ func apiKeyForRequest(req executorRequest, cfg pluginConfig) string {
 
 // runStream performs the upstream call and forwards SSE frames through the
 // host stream bridge until done, then closes the plugin stream.
-func runStream(req executorRequest, cfg pluginConfig, route modelRoute, endpointURL string, headers map[string][]string, apiKey string, body []byte, streamID string) {
+func runStream(req executorRequest, cfg pluginConfig, route modelRoute, baseURL string, headers map[string][]string, apiKey string, streamID string) {
 	closeStream := func(errMsg string) {
 		_, _ = callHost("host.stream.close", map[string]any{"stream_id": streamID, "error": strings.TrimSpace(errMsg)})
 	}
@@ -993,10 +1207,47 @@ func runStream(req executorRequest, cfg pluginConfig, route modelRoute, endpoint
 		}
 	}()
 
-	resp, err := doUpstreamStream(req.HostCallbackID, http.MethodPost, endpointURL, headers, apiKey, body)
-	if err != nil {
-		closeStream(err.Error())
+	// Endpoint auto-detection: without explicit config, a 400 from
+	// /chat/completions is retried once against /responses and remembered.
+	endpoints := []string{route.Endpoint}
+	if route.Endpoint == "chat" && !routeConfigured(cfg, route.Model) {
+		endpoints = append(endpoints, "responses")
+	}
+	var resp *hostStreamHandle
+	usedEndpoint := route.Endpoint
+	for _, ep := range endpoints {
+		r := route
+		r.Endpoint = ep
+		// Gate rule 4: zen only answers streaming requests.
+		body, err := prepareUpstreamBody(req, r)
+		if err != nil {
+			closeStream(err.Error())
+			return
+		}
+		resp, err = doUpstreamStream(req.HostCallbackID, http.MethodPost, baseURL+r.EndpointPath(), headers, apiKey, body)
+		if err != nil {
+			closeStream(err.Error())
+			return
+		}
+		usedEndpoint = ep
+		if resp.StatusCode == 400 && ep == "chat" && len(endpoints) > 1 {
+			// Drain the error body so the abandoned host stream is reaped.
+			for i := 0; i < 8; i++ {
+				chunk, errRead := readHostStream(resp.StreamID)
+				if errRead != nil || chunk.Done || chunk.Error != "" {
+					break
+				}
+			}
+			continue
+		}
+		break
+	}
+	if resp == nil {
+		closeStream("zen upstream: no endpoint attempted")
 		return
+	}
+	if usedEndpoint != route.Endpoint {
+		rememberEndpoint(route.Model, usedEndpoint)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		// Drain a bit of the error body for the message, then close.
