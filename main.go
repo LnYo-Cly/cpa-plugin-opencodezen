@@ -63,6 +63,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"time"
 	"unicode"
 	"unsafe"
 
@@ -87,7 +88,7 @@ const (
 	defaultUserAgent = "opencode/1.18.31 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14"
 )
 
-var pluginVersion = "0.5.2"
+var pluginVersion = "0.6.0"
 
 var (
 	canonicalSessionRe = regexp.MustCompile(`^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$`)
@@ -933,6 +934,15 @@ func execute(payload []byte, stream bool) ([]byte, error) {
 		if err != nil {
 			return nil, err
 		}
+		if route.Endpoint == "responses" {
+			// The plugin declares chat-completions output, so the folded
+			// responses object must become a chat.completion before the host
+			// translates it for the requesting client.
+			folded, err = responsesCompletionToChat(folded, req.Model)
+			if err != nil {
+				return nil, err
+			}
+		}
 		return okEnvelopeJSON(executorResponse{Payload: folded, Headers: respHeaders})
 	}
 
@@ -1028,9 +1038,33 @@ func runStream(req executorRequest, cfg pluginConfig, route modelRoute, endpoint
 	src := strings.ToLower(strings.TrimSpace(req.SourceFormat))
 	rawData := src == "openai" || strings.Contains(src, "chat")
 
+	emit := func(frame []byte) error { return emitStreamFrame(streamID, frame) }
+	if route.Endpoint == "responses" {
+		// The plugin declares chat-completions output, so the host expects chat
+		// chunks; upstream /responses events must be converted first.
+		conv := newResponsesChatStreamConverter(req.Model)
+		emit = func(frame []byte) error {
+			payload := stripSSEDataFraming(frame)
+			outs, err := conv.convert([]byte(payload))
+			if err != nil {
+				return err
+			}
+			for _, out := range outs {
+				framed := out
+				if !rawData {
+					framed = []byte("data: " + string(out) + "\n\n")
+				}
+				if err := emitStreamFrame(streamID, framed); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
+	}
+
 	reassembler := &sseReassembler{
 		rawData: rawData,
-		emit:    func(frame []byte) error { return emitStreamFrame(streamID, frame) },
+		emit:    emit,
 	}
 	for {
 		chunk, err := readHostStream(resp.StreamID)
@@ -2227,6 +2261,260 @@ func sseFrames(sse []byte) []string {
 	}
 	return frames
 }
+
+// ---------------------------------------------------------------------------
+// responses → chat conversion
+//
+// The plugin declares chat-completions as its executor output format, so the
+// host expects chat-format payloads from the plugin and translates them for
+// responses/claude/gemini clients itself. Models routed to the /responses
+// endpoint (muse-spark) return Responses API events instead, so both the
+// stream and the folded non-stream payload must be converted to chat format
+// before they reach the host; otherwise the host translators drop the frames
+// (stream) or produce garbage (non-stream).
+// ---------------------------------------------------------------------------
+
+// responsesChatStreamConverter converts Responses API stream events into
+// chat.completion.chunk payloads, statefully.
+type responsesChatStreamConverter struct {
+	model    string
+	id       string
+	created  int64
+	sawDelta map[string]bool
+}
+
+func newResponsesChatStreamConverter(model string) *responsesChatStreamConverter {
+	return &responsesChatStreamConverter{model: model, sawDelta: map[string]bool{}}
+}
+
+// convert maps one SSE payload (responses event JSON, framing stripped) to
+// zero or more chat chunk JSON payloads. A non-JSON payload is dropped.
+func (c *responsesChatStreamConverter) convert(payload []byte) ([][]byte, error) {
+	var ev struct {
+		Type     string `json:"type"`
+		ItemID   string `json:"item_id"`
+		Delta    string `json:"delta"`
+		Response struct {
+			ID        string `json:"id"`
+			CreatedAt int64  `json:"created_at"`
+			Status    string `json:"status"`
+			Error     *struct {
+				Message string `json:"message"`
+			} `json:"error"`
+			Usage *struct {
+				InputTokens  int64 `json:"input_tokens"`
+				OutputTokens int64 `json:"output_tokens"`
+				TotalTokens  int64 `json:"total_tokens"`
+			} `json:"usage"`
+		} `json:"response"`
+		Item struct {
+			ID      string `json:"id"`
+			Type    string `json:"type"`
+			Content []struct {
+				Type string `json:"type"`
+				Text string `json:"text"`
+			} `json:"content"`
+		} `json:"item"`
+	}
+	if err := json.Unmarshal(payload, &ev); err != nil {
+		return nil, nil
+	}
+	switch ev.Type {
+	case "response.created":
+		if ev.Response.ID != "" {
+			c.id = ev.Response.ID
+		}
+		if ev.Response.CreatedAt != 0 {
+			c.created = ev.Response.CreatedAt
+		}
+		return [][]byte{c.chunk(map[string]any{"role": "assistant"}, nil, nil)}, nil
+	case "response.output_text.delta":
+		if ev.ItemID != "" {
+			c.sawDelta[ev.ItemID] = true
+		}
+		if ev.Delta == "" {
+			return nil, nil
+		}
+		return [][]byte{c.chunk(map[string]any{"content": ev.Delta}, nil, nil)}, nil
+	case "response.reasoning_summary_text.delta", "response.reasoning_text.delta":
+		if ev.ItemID != "" {
+			c.sawDelta[ev.ItemID] = true
+		}
+		if ev.Delta == "" {
+			return nil, nil
+		}
+		return [][]byte{c.chunk(map[string]any{"reasoning_content": ev.Delta}, nil, nil)}, nil
+	case "response.output_item.done":
+		// Fallback: an item completed without streamed deltas (some upstreams
+		// only send the final item). Emit its text once.
+		if ev.Item.Type != "message" || ev.Item.ID == "" || c.sawDelta[ev.Item.ID] {
+			return nil, nil
+		}
+		var text strings.Builder
+		for _, part := range ev.Item.Content {
+			if part.Type == "output_text" || part.Type == "text" {
+				text.WriteString(part.Text)
+			}
+		}
+		if text.Len() == 0 {
+			return nil, nil
+		}
+		return [][]byte{c.chunk(map[string]any{"content": text.String()}, nil, nil)}, nil
+	case "response.completed":
+		var usage map[string]any
+		if ev.Response.Usage != nil {
+			usage = map[string]any{
+				"prompt_tokens":     ev.Response.Usage.InputTokens,
+				"completion_tokens": ev.Response.Usage.OutputTokens,
+				"total_tokens":      ev.Response.Usage.TotalTokens,
+			}
+		}
+		return [][]byte{c.chunk(map[string]any{}, strPtr("stop"), usage)}, nil
+	case "response.failed", "response.incomplete":
+		msg := "upstream response " + ev.Type
+		if ev.Response.Error != nil && ev.Response.Error.Message != "" {
+			msg = ev.Response.Error.Message
+		} else if ev.Response.Status != "" {
+			msg = "upstream response " + ev.Response.Status
+		}
+		return nil, fmt.Errorf("zen responses stream failed: %s", msg)
+	}
+	return nil, nil
+}
+
+// chunk renders one chat.completion.chunk payload.
+func (c *responsesChatStreamConverter) chunk(delta map[string]any, finish *string, usage map[string]any) []byte {
+	id := c.id
+	if id == "" {
+		id = canonicalID("chatcmpl", c.model)
+	}
+	created := c.created
+	if created == 0 {
+		created = time.Now().Unix()
+	}
+	m := map[string]any{
+		"id":      id,
+		"object":  "chat.completion.chunk",
+		"created": created,
+		"model":   c.model,
+		"choices": []any{map[string]any{
+			"index":         0,
+			"delta":         delta,
+			"finish_reason": finish,
+		}},
+	}
+	if usage != nil {
+		m["usage"] = usage
+	}
+	b, err := json.Marshal(m)
+	if err != nil {
+		return []byte("{}")
+	}
+	return b
+}
+
+// responsesCompletionToChat converts a folded Responses API response object
+// into a chat.completion object for the non-streaming path.
+func responsesCompletionToChat(body []byte, model string) ([]byte, error) {
+	var resp struct {
+		ID        string `json:"id"`
+		Model     string `json:"model"`
+		Status    string `json:"status"`
+		CreatedAt int64  `json:"created_at"`
+		Output    []struct {
+			Type    string `json:"type"`
+			Role    string `json:"role"`
+			Content []struct {
+				Type string `json:"type"`
+				Text string `json:"text"`
+			} `json:"content"`
+			Summary []struct {
+				Type string `json:"type"`
+				Text string `json:"text"`
+			} `json:"summary"`
+		} `json:"output"`
+		Error *struct {
+			Message string `json:"message"`
+		} `json:"error"`
+		Usage *struct {
+			InputTokens  int64 `json:"input_tokens"`
+			OutputTokens int64 `json:"output_tokens"`
+			TotalTokens  int64 `json:"total_tokens"`
+		} `json:"usage"`
+	}
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, fmt.Errorf("zen responses payload is not valid JSON: %w", err)
+	}
+	if resp.Status == "failed" || resp.Error != nil {
+		msg := "upstream response failed"
+		if resp.Error != nil && resp.Error.Message != "" {
+			msg = resp.Error.Message
+		}
+		return nil, fmt.Errorf("zen responses stream failed: %s", msg)
+	}
+	var content, reasoning strings.Builder
+	for _, item := range resp.Output {
+		switch item.Type {
+		case "message":
+			for _, part := range item.Content {
+				if part.Type == "output_text" || part.Type == "text" {
+					content.WriteString(part.Text)
+				}
+			}
+		case "reasoning":
+			for _, sum := range item.Summary {
+				reasoning.WriteString(sum.Text)
+			}
+		}
+	}
+	if resp.Model != "" {
+		model = resp.Model
+	}
+	id := resp.ID
+	if id == "" {
+		id = canonicalID("chatcmpl", model)
+	}
+	created := resp.CreatedAt
+	if created == 0 {
+		created = time.Now().Unix()
+	}
+	message := map[string]any{"role": "assistant", "content": content.String()}
+	if reasoning.Len() > 0 {
+		message["reasoning_content"] = reasoning.String()
+	}
+	m := map[string]any{
+		"id":      id,
+		"object":  "chat.completion",
+		"created": created,
+		"model":   model,
+		"choices": []any{map[string]any{
+			"index":         0,
+			"message":       message,
+			"finish_reason": "stop",
+		}},
+	}
+	if resp.Usage != nil {
+		m["usage"] = map[string]any{
+			"prompt_tokens":     resp.Usage.InputTokens,
+			"completion_tokens": resp.Usage.OutputTokens,
+			"total_tokens":      resp.Usage.TotalTokens,
+		}
+	}
+	return json.Marshal(m)
+}
+
+// stripSSEDataFraming removes the "data:" prefix and surrounding whitespace
+// from one emitted SSE frame, yielding the raw payload.
+func stripSSEDataFraming(frame []byte) string {
+	s := strings.TrimSpace(string(frame))
+	if after, ok := strings.CutPrefix(s, "data:"); ok {
+		s = strings.TrimSpace(after)
+	}
+	return s
+}
+
+// strPtr is a tiny helper for optional string fields.
+func strPtr(s string) *string { return &s }
 
 func truncate(b []byte, n int) string {
 	s := strings.TrimSpace(string(b))

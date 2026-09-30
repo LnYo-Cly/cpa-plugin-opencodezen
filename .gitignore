@@ -3,3 +3,8 @@ dist/
 *.dll
 *.dylib
 *.h
+cpa-plugin-opencodezen.exe
+muse_stream.txt
+resp_body*.json
+chat_body.json
+*.so

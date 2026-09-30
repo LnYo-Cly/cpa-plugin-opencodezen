@@ -28,9 +28,15 @@
 
 3. **SSE 流式传输重拼与保活过滤（Stream Reassembly）**：
    - 修复上游分片造成的跨包 SSE 截断问题，确保下游收到的每个 `data: {...}` 均为完整合法的 JSON 对象。
-   - 自动过滤上游的 `: keep-alive` 心跳注释帧，避免 LobeHub、NextChat 等客户端因非法 JSON 报错崩溃。
+   - 自动过滤上游 `: keep-alive` 心跳注释帧，避免 LobeHub、NextChat 等客户端因非法 JSON 报错崩溃。
+   - 不转发上游 `[DONE]` 终止符（宿主会在插件流关闭后自动补齐，避免重复）。
 
-4. **无感集成，原生提供商体验**：
+4. **Responses → Chat 双向格式转换（Format Conversion）**：
+   - 插件向宿主声明 `chat-completions` 输出格式，宿主据此为 responses/claude/gemini 客户端做翻译。
+   - 走 `/responses` 上游的模型（如 `muse-spark`）返回的是 Responses API 事件流，插件会将其实时转换为 `chat.completion.chunk` 帧（含 role 首帧、增量 content、带 usage 的收尾帧），非流式请求则折叠为标准 `chat.completion` 对象。
+   - 修复此前 muse 系列模型流式返回 `empty_stream`、非流式返回无法解析载荷的问题。
+
+5. **无感集成，原生提供商体验**：
    - 配置完全脱离插件管理面板，用户只需在凭证目录或 Web 认证面板中添加一个标准的 `zen` 认证文件即可，服务地址与 API Key 支持动态感知生效。
 
 ---

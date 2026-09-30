@@ -1298,3 +1298,169 @@ func TestSSEReassemblerCRLFAndKeepAlive(t *testing.T) {
 		t.Fatalf("unexpected frame 0: %q", string(emitted[0]))
 	}
 }
+
+func TestResponsesChatStreamConverter(t *testing.T) {
+	c := newResponsesChatStreamConverter("muse-spark-1.3-contributor-free")
+	var out [][]byte
+	feed := func(payload string) {
+		outs, err := c.convert([]byte(payload))
+		if err != nil {
+			t.Fatalf("convert(%s): %v", payload, err)
+		}
+		out = append(out, outs...)
+	}
+	feed(`{"type":"response.created","response":{"id":"resp_abc","created_at":1700000000}}`)
+	feed(`{"type":"response.in_progress","response":{"id":"resp_abc"}}`)
+	feed(`{"type":"response.output_item.added","output_index":0,"item":{"id":"rs_1","type":"reasoning"}}`)
+	feed(`{"type":"response.output_item.done","output_index":0,"item":{"id":"rs_1","type":"reasoning"}}`)
+	feed(`{"type":"response.output_item.added","output_index":1,"item":{"id":"msg_1","type":"message"}}`)
+	feed(`{"type":"response.output_text.delta","item_id":"msg_1","delta":"1\n2\n"}`)
+	feed(`{"type":"response.output_text.delta","item_id":"msg_1","delta":"3"}`)
+	feed(`{"type":"response.completed","response":{"id":"resp_abc","status":"completed","usage":{"input_tokens":10,"output_tokens":5,"total_tokens":15}}}`)
+
+	if len(out) != 4 {
+		t.Fatalf("expected 4 chunks, got %d: %v", len(out), out)
+	}
+	var chunks []map[string]any
+	for _, raw := range out {
+		var m map[string]any
+		if err := json.Unmarshal(raw, &m); err != nil {
+			t.Fatalf("chunk not JSON: %v", err)
+		}
+		chunks = append(chunks, m)
+	}
+	if chunks[0]["id"] != "resp_abc" || chunks[0]["object"] != "chat.completion.chunk" {
+		t.Fatalf("unexpected chunk 0: %v", chunks[0])
+	}
+	role := chunks[0]["choices"].([]any)[0].(map[string]any)["delta"].(map[string]any)
+	if role["role"] != "assistant" {
+		t.Fatalf("chunk 0 delta should carry assistant role, got %v", role)
+	}
+	if content := chunks[1]["choices"].([]any)[0].(map[string]any)["delta"].(map[string]any)["content"]; content != "1\n2\n" {
+		t.Fatalf("chunk 1 content: %v", content)
+	}
+	if content := chunks[2]["choices"].([]any)[0].(map[string]any)["delta"].(map[string]any)["content"]; content != "3" {
+		t.Fatalf("chunk 2 content: %v", content)
+	}
+	last := chunks[3]["choices"].([]any)[0].(map[string]any)
+	if last["finish_reason"] != "stop" {
+		t.Fatalf("final finish_reason: %v", last["finish_reason"])
+	}
+	usage := chunks[3]["usage"].(map[string]any)
+	if usage["prompt_tokens"] != float64(10) || usage["completion_tokens"] != float64(5) || usage["total_tokens"] != float64(15) {
+		t.Fatalf("final usage: %v", usage)
+	}
+}
+
+func TestResponsesChatStreamConverterItemDoneFallback(t *testing.T) {
+	c := newResponsesChatStreamStreamConverterFallbackHelper(t)
+	// No deltas streamed: the completed message item must be emitted once.
+	outs, err := c.convert([]byte(`{"type":"response.output_item.done","item":{"id":"msg_9","type":"message","content":[{"type":"output_text","text":"hello world"}]}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(outs) != 1 {
+		t.Fatalf("expected 1 fallback chunk, got %d", len(outs))
+	}
+	var m map[string]any
+	if err := json.Unmarshal(outs[0], &m); err != nil {
+		t.Fatal(err)
+	}
+	delta := m["choices"].([]any)[0].(map[string]any)["delta"].(map[string]any)
+	if delta["content"] != "hello world" {
+		t.Fatalf("fallback content: %v", delta)
+	}
+	// The same item done again must not re-emit (delta already covered).
+	outs, err = c.convert([]byte(`{"type":"response.output_text.delta","item_id":"msg_9","delta":"x"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(outs) != 1 {
+		t.Fatalf("delta chunk expected, got %d", len(outs))
+	}
+	outs, err = c.convert([]byte(`{"type":"response.output_item.done","item":{"id":"msg_9","type":"message","content":[{"type":"output_text","text":"hello world"}]}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(outs) != 0 {
+		t.Fatalf("item done after deltas should not re-emit, got %d", len(outs))
+	}
+}
+
+func newResponsesChatStreamStreamConverterFallbackHelper(t *testing.T) *responsesChatStreamConverter {
+	t.Helper()
+	return newResponsesChatStreamConverter("muse-spark")
+}
+
+func TestResponsesChatStreamConverterFailed(t *testing.T) {
+	c := newResponsesChatStreamConverter("muse-spark")
+	_, err := c.convert([]byte(`{"type":"response.failed","response":{"status":"failed","error":{"message":"rate limited"}}}`))
+	if err == nil || !strings.Contains(err.Error(), "rate limited") {
+		t.Fatalf("expected failure error, got %v", err)
+	}
+}
+
+func TestResponsesChatStreamConverterNonJSONDropped(t *testing.T) {
+	c := newResponsesChatStreamConverter("muse-spark")
+	outs, err := c.convert([]byte(": keep-alive"))
+	if err != nil || len(outs) != 0 {
+		t.Fatalf("non-JSON payload should be dropped, got %v %v", outs, err)
+	}
+}
+
+func TestResponsesCompletionToChat(t *testing.T) {
+	folded := `{
+		"id":"resp_abc","object":"response","status":"completed","model":"muse-spark-1.3-contributor-free","created_at":1700000000,
+		"output":[
+			{"id":"rs_1","type":"reasoning","summary":[{"type":"summary_text","text":"thinking"}]},
+			{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"output_text","text":"天空是蓝色的。"}]}
+		],
+		"usage":{"input_tokens":12,"output_tokens":7,"total_tokens":19}
+	}`
+	out, err := responsesCompletionToChat([]byte(folded), "fallback-model")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(out, &m); err != nil {
+		t.Fatal(err)
+	}
+	if m["object"] != "chat.completion" || m["id"] != "resp_abc" || m["model"] != "muse-spark-1.3-contributor-free" {
+		t.Fatalf("header fields wrong: %v", m)
+	}
+	choice := m["choices"].([]any)[0].(map[string]any)
+	if choice["finish_reason"] != "stop" {
+		t.Fatalf("finish_reason: %v", choice["finish_reason"])
+	}
+	msg := choice["message"].(map[string]any)
+	if msg["role"] != "assistant" || msg["content"] != "天空是蓝色的。" {
+		t.Fatalf("message wrong: %v", msg)
+	}
+	if msg["reasoning_content"] != "thinking" {
+		t.Fatalf("reasoning_content: %v", msg["reasoning_content"])
+	}
+	usage := m["usage"].(map[string]any)
+	if usage["prompt_tokens"] != float64(12) || usage["completion_tokens"] != float64(7) || usage["total_tokens"] != float64(19) {
+		t.Fatalf("usage: %v", usage)
+	}
+}
+
+func TestResponsesCompletionToChatFailed(t *testing.T) {
+	_, err := responsesCompletionToChat([]byte(`{"id":"r","status":"failed","error":{"message":"boom"}}`), "m")
+	if err == nil || !strings.Contains(err.Error(), "boom") {
+		t.Fatalf("expected failure error, got %v", err)
+	}
+}
+
+func TestStripSSEDataFraming(t *testing.T) {
+	cases := map[string]string{
+		"data: {\"a\":1}\n\n": "{\"a\":1}",
+		"{\"a\":1}":           "{\"a\":1}",
+		"data: [DONE]":       "[DONE]",
+	}
+	for in, want := range cases {
+		if got := stripSSEDataFraming([]byte(in)); got != want {
+			t.Fatalf("stripSSEDataFraming(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
