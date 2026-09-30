@@ -1616,3 +1616,28 @@ func TestConfigureParsesExcludeModelsCommaString(t *testing.T) {
 		t.Fatalf("APIKeys = %v", cfg.APIKeys)
 	}
 }
+
+func TestConfigureParsesSemicolonSeparatedKeys(t *testing.T) {
+	// Regression: management-center users entered "key1;key2" and the plugin
+	// treated the whole string as one key, producing an invalid credential.
+	payload, err := json.Marshal(struct {
+		ConfigYAML []byte `json:"config_yaml"`
+	}{[]byte("api-keys: \"oc_sk_aaa;oc_sk_bbb, oc_sk_ccc\"\n")})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if err := configure(payload); err != nil {
+		t.Fatalf("configure: %v", err)
+	}
+	t.Cleanup(func() { storeConfig(defaultPluginConfig()) })
+	cfg := loadedConfig()
+	want := []string{"oc_sk_aaa", "oc_sk_bbb", "oc_sk_ccc"}
+	if len(cfg.APIKeys) != len(want) {
+		t.Fatalf("APIKeys = %v, want %v", cfg.APIKeys, want)
+	}
+	for i, k := range want {
+		if cfg.APIKeys[i] != k {
+			t.Fatalf("APIKeys = %v, want %v", cfg.APIKeys, want)
+		}
+	}
+}

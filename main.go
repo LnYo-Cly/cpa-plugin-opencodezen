@@ -89,7 +89,7 @@ const (
 	defaultUserAgent = "opencode/1.18.31 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14"
 )
 
-var pluginVersion = "0.7.2"
+var pluginVersion = "0.7.3"
 
 var (
 	canonicalSessionRe = regexp.MustCompile(`^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$`)
@@ -288,7 +288,11 @@ func applyConfigNode(cfg *pluginConfig, node map[string]any) {
 			}
 		}
 	case string:
-		for _, part := range strings.Split(t, ",") {
+		// Accept comma, semicolon, or whitespace separated keys; management
+		// center users have used ";" and gotten one invalid concatenated key.
+		for _, part := range strings.FieldsFunc(t, func(r rune) bool {
+			return r == ',' || r == ';' || r == ' ' || r == '\t' || r == '\n' || r == '\r'
+		}) {
 			cfg.APIKeys = append(cfg.APIKeys, part)
 		}
 	}
@@ -300,7 +304,9 @@ func applyConfigNode(cfg *pluginConfig, node map[string]any) {
 			}
 		}
 	case string:
-		for _, part := range strings.Split(t, ",") {
+		for _, part := range strings.FieldsFunc(t, func(r rune) bool {
+			return r == ',' || r == ';' || r == ' ' || r == '\t' || r == '\n' || r == '\r'
+		}) {
 			cfg.ExcludeModels = append(cfg.ExcludeModels, part)
 		}
 	}
