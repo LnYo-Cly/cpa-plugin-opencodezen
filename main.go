@@ -348,23 +348,10 @@ func stringSliceValue(values ...any) []string {
 	return nil
 }
 
-// defaultModelRoutes defines the built-in routing for known Zen models.
-var defaultModelRoutes = map[string]string{
-	"muse-spark-1.3-contributor-free": "responses",
-	"muse-spark-1.3":                  "responses",
-	"mimo-v2.6-flash-free":            "chat",
-	"mimo-v2.5-free":                  "chat",
-	"ling-3.0-flash-fin-free":         "chat",
-	"nemotron-3-ultra-free":           "chat",
-}
-
 // inferEndpoint resolves the upstream endpoint ("chat" or "responses") for a model.
 // Any model containing "muse" or "responses" defaults to "responses"; others to "chat".
 func inferEndpoint(model string) string {
 	lower := strings.ToLower(model)
-	if ep, ok := defaultModelRoutes[lower]; ok {
-		return ep
-	}
 	if strings.Contains(lower, "muse") || strings.Contains(lower, "responses") {
 		return "responses"
 	}
@@ -500,12 +487,6 @@ type executorResponse struct {
 
 type executorStreamResponse struct {
 	Headers map[string][]string `json:"headers,omitempty"`
-	Chunks  []streamChunk       `json:"chunks,omitempty"`
-}
-
-type streamChunk struct {
-	Payload []byte `json:"Payload"`
-	Err     string `json:"Err,omitempty"`
 }
 
 type httpStreamChunk struct {
@@ -849,10 +830,8 @@ func modelRegistration() ([]byte, error) {
 		if m.Model == "" {
 			continue
 		}
+		// configure() and defaultZenModels guarantee Alias is non-empty.
 		alias := m.Alias
-		if alias == "" {
-			alias = m.Model
-		}
 		caps := resolveModelCapabilities(m)
 		models = append(models, modelInfo{
 			ID:                       alias,
@@ -1340,7 +1319,7 @@ func responsesToChat(root map[string]any) error {
 			}
 			message := map[string]any{"role": entry["role"]}
 			if content, ok := entry["content"]; ok {
-				message["content"] = normalizeResponsesContent(content)
+				message["content"] = renamePartType(content, "text", "input_text", "output_text")
 			}
 			messages = append(messages, message)
 		}
@@ -1364,7 +1343,10 @@ func responsesToChat(root map[string]any) error {
 	return nil
 }
 
-func normalizeResponsesContent(content any) any {
+// renamePartType rewrites content parts whose "type" matches one of
+// fromTypes to toType, copying all other fields verbatim. Content is
+// returned unchanged when no part matched.
+func renamePartType(content any, toType string, fromTypes ...string) any {
 	parts, ok := content.([]any)
 	if !ok {
 		return content
@@ -1377,20 +1359,28 @@ func normalizeResponsesContent(content any) any {
 			out = append(out, item)
 			continue
 		}
-		if part["type"] == "input_text" || part["type"] == "output_text" {
-			converted := make(map[string]any, len(part))
-			for k, v := range part {
-				if k == "type" {
-					converted[k] = "text"
-				} else {
-					converted[k] = v
-				}
+		partType, _ := part["type"].(string)
+		matched := false
+		for _, want := range fromTypes {
+			if partType == want {
+				matched = true
+				break
 			}
-			out = append(out, converted)
-			changed = true
+		}
+		if !matched {
+			out = append(out, part)
 			continue
 		}
-		out = append(out, part)
+		converted := make(map[string]any, len(part))
+		for k, v := range part {
+			if k == "type" {
+				converted[k] = toType
+			} else {
+				converted[k] = v
+			}
+		}
+		out = append(out, converted)
+		changed = true
 	}
 	if !changed {
 		return content
@@ -1457,7 +1447,7 @@ func chatToResponses(root map[string]any) error {
 		}
 		message := map[string]any{"role": entry["role"]}
 		if content, ok := entry["content"]; ok {
-			message["content"] = normalizeChatContent(content)
+			message["content"] = renamePartType(content, "input_text", "text")
 		}
 		input = append(input, message)
 	}
@@ -1474,40 +1464,6 @@ func chatToResponses(root map[string]any) error {
 		delete(root, "response_format")
 	}
 	return nil
-}
-
-func normalizeChatContent(content any) any {
-	parts, ok := content.([]any)
-	if !ok {
-		return content
-	}
-	out := make([]any, 0, len(parts))
-	changed := false
-	for _, item := range parts {
-		part, ok := item.(map[string]any)
-		if !ok {
-			out = append(out, item)
-			continue
-		}
-		if part["type"] == "text" {
-			converted := make(map[string]any, len(part))
-			for k, v := range part {
-				if k == "type" {
-					converted[k] = "input_text"
-				} else {
-					converted[k] = v
-				}
-			}
-			out = append(out, converted)
-			changed = true
-			continue
-		}
-		out = append(out, part)
-	}
-	if !changed {
-		return content
-	}
-	return out
 }
 
 func chatToolsToResponses(tools []any) []any {
@@ -1621,49 +1577,36 @@ func firstUserText(body []byte) string {
 		return ""
 	}
 	if items, ok := root["messages"].([]any); ok {
-		for _, item := range items {
-			msg, ok := item.(map[string]any)
-			if !ok || msg["role"] != "user" {
-				continue
-			}
-			if s, ok := msg["content"].(string); ok && s != "" {
-				return s
-			}
-			if parts, ok := msg["content"].([]any); ok {
-				for _, part := range parts {
-					pm, ok := part.(map[string]any)
-					if !ok {
-						continue
-					}
-					if s, ok := pm["text"].(string); ok && s != "" {
-						return s
-					}
-				}
-			}
-		}
-		return ""
+		return firstUserTextFromItems(items)
 	}
 	switch input := root["input"].(type) {
 	case string:
 		return input
 	case []any:
-		for _, item := range input {
-			msg, ok := item.(map[string]any)
-			if !ok || msg["role"] != "user" {
-				continue
-			}
-			if s, ok := msg["content"].(string); ok && s != "" {
-				return s
-			}
-			if parts, ok := msg["content"].([]any); ok {
-				for _, part := range parts {
-					pm, ok := part.(map[string]any)
-					if !ok {
-						continue
-					}
-					if s, ok := pm["text"].(string); ok && s != "" {
-						return s
-					}
+		return firstUserTextFromItems(input)
+	}
+	return ""
+}
+
+// firstUserTextFromItems returns the text of the first user message in a
+// chat-style message list (string content or text parts).
+func firstUserTextFromItems(items []any) string {
+	for _, item := range items {
+		msg, ok := item.(map[string]any)
+		if !ok || msg["role"] != "user" {
+			continue
+		}
+		if s, ok := msg["content"].(string); ok && s != "" {
+			return s
+		}
+		if parts, ok := msg["content"].([]any); ok {
+			for _, part := range parts {
+				pm, ok := part.(map[string]any)
+				if !ok {
+					continue
+				}
+				if s, ok := pm["text"].(string); ok && s != "" {
+					return s
 				}
 			}
 		}
@@ -1900,7 +1843,7 @@ func emitStreamFrame(streamID string, frame []byte) error {
 	if len(frame) == 0 {
 		return nil
 	}
-	if s := strings.TrimSpace(string(frame)); s == "[DONE]" || s == "data: [DONE]" {
+	if isDoneTerminator(string(frame)) {
 		return nil
 	}
 	_, err := callHost("host.stream.emit", map[string]any{
@@ -2009,30 +1952,16 @@ func isDoneTerminator(s string) bool {
 	return s == "[DONE]" || s == "data: [DONE]"
 }
 
-// normalizeSSEFrame converts one upstream SSE line into the payload to
-// forward through the host stream bridge. Empty lines, keep-alive comments,
-// and (in raw mode) framing-only lines are dropped. A bare JSON object line is
-// treated as an unframed data payload.
+// normalizeSSEFrame converts one non-data upstream SSE line into the
+// payload to forward through the host stream bridge. Empty lines and
+// keep-alive comments are dropped; event/id/retry lines pass through framed
+// (dropped in raw mode); a bare JSON object line is treated as an unframed
+// data payload. data: lines and [DONE] terminators are handled by the
+// caller (sseReassembler.handleLine).
 func normalizeSSEFrame(rawData bool, raw []byte) []byte {
 	s := strings.TrimSpace(string(raw))
 	if s == "" || strings.HasPrefix(s, ":") {
 		return nil
-	}
-	if s == "[DONE]" {
-		if rawData {
-			return []byte("[DONE]")
-		}
-		return []byte("data: [DONE]\n\n")
-	}
-	if after, ok := strings.CutPrefix(s, "data:"); ok {
-		after = strings.TrimLeft(after, " \t")
-		if after == "" || strings.HasPrefix(after, ":") {
-			return nil
-		}
-		if rawData {
-			return []byte(after)
-		}
-		return []byte(s + "\n\n")
 	}
 	if strings.HasPrefix(s, "event:") || strings.HasPrefix(s, "id:") || strings.HasPrefix(s, "retry:") {
 		if rawData {

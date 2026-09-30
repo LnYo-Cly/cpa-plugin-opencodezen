@@ -998,39 +998,22 @@ func TestExecuteStreamRequiresStreamID(t *testing.T) {
 	_ = route
 }
 
-func TestNormalizeSSEFrameDropsKeepAlivesAndComments(t *testing.T) {
-	// ": keep-alive" should be dropped completely
+func TestNormalizeSSEFrameNonDataLines(t *testing.T) {
+	// Keep-alive comments are dropped.
 	if res := normalizeSSEFrame(false, []byte(": keep-alive\n")); len(res) != 0 {
 		t.Fatalf("expected keep-alive to be dropped, got %q", string(res))
-	}
-	// "data: : keep-alive" should also be dropped
-	if res := normalizeSSEFrame(false, []byte("data: : keep-alive\n")); len(res) != 0 {
-		t.Fatalf("expected data keep-alive to be dropped, got %q", string(res))
-	}
-	// standard data chunk should be preserved as a complete SSE frame
-	validChunk := []byte("data: {\"choices\":[]}\n")
-	res := normalizeSSEFrame(false, validChunk)
-	if string(res) != "data: {\"choices\":[]}\n\n" {
-		t.Fatalf("expected chunk to be preserved, got %q", string(res))
-	}
-}
-
-func TestNormalizeSSEFrameRawMode(t *testing.T) {
-	// Raw mode strips the "data: " prefix: the host applies SSE framing itself
-	// for chat-completions clients.
-	if res := normalizeSSEFrame(true, []byte("data: {\"choices\":[]}\n")); string(res) != "{\"choices\":[]}" {
-		t.Fatalf("raw data chunk = %q", string(res))
-	}
-	if res := normalizeSSEFrame(true, []byte("data: [DONE]\n")); string(res) != "[DONE]" {
-		t.Fatalf("raw [DONE] = %q", string(res))
 	}
 	// Event lines carry no data payload in raw mode.
 	if res := normalizeSSEFrame(true, []byte("event: response.completed\n")); len(res) != 0 {
 		t.Fatalf("raw event line = %q", string(res))
 	}
-	// Keep-alives stay dropped.
-	if res := normalizeSSEFrame(true, []byte(": keep-alive\n")); len(res) != 0 {
-		t.Fatalf("raw keep-alive = %q", string(res))
+	// A bare JSON line is treated as an unframed data payload.
+	bare := []byte(`{"choices":[]}`)
+	if res := normalizeSSEFrame(true, bare); string(res) != `{"choices":[]}` {
+		t.Fatalf("raw bare JSON = %q", string(res))
+	}
+	if res := normalizeSSEFrame(false, bare); string(res) != "data: {\"choices\":[]}\n\n" {
+		t.Fatalf("framed bare JSON = %q", string(res))
 	}
 }
 
