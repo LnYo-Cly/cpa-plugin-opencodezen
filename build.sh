@@ -17,7 +17,7 @@
 set -euo pipefail
 
 PLUGIN_NAME="zen"
-PLUGIN_VERSION="${PLUGIN_VERSION:-0.7.1}"
+PLUGIN_VERSION="${PLUGIN_VERSION:-0.7.4}"
 GO_IMAGE="${GO_IMAGE:-golang:1.26-bookworm}"
 GOOS="${GOOS:-linux}"
 GOARCH="${GOARCH:-$(go env GOARCH 2>/dev/null || echo amd64)}"

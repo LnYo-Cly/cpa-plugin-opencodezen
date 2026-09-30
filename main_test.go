@@ -1110,10 +1110,10 @@ func TestPrepareUpstreamBodyDropsReasoningItems(t *testing.T) {
 		"input": []any{
 			map[string]any{"role": "user", "content": []any{map[string]any{"type": "input_text", "text": "hello"}}},
 			map[string]any{
-				"id":               "rs_gen-test",
-				"type":             "reasoning",
+				"id":                "rs_gen-test",
+				"type":              "reasoning",
 				"encrypted_content": "",
-				"summary":          []any{map[string]any{"type": "summary_text", "text": "thinking"}},
+				"summary":           []any{map[string]any{"type": "summary_text", "text": "thinking"}},
 			},
 			map[string]any{"type": "message", "role": "assistant", "content": []any{map[string]any{"type": "output_text", "text": "hi there", "annotations": []any{}}}},
 			map[string]any{"role": "user", "content": []any{map[string]any{"type": "input_text", "text": "reply one word"}}},
@@ -1481,7 +1481,7 @@ func TestStripSSEDataFraming(t *testing.T) {
 	cases := map[string]string{
 		"data: {\"a\":1}\n\n": "{\"a\":1}",
 		"{\"a\":1}":           "{\"a\":1}",
-		"data: [DONE]":       "[DONE]",
+		"data: [DONE]":        "[DONE]",
 	}
 	for in, want := range cases {
 		if got := stripSSEDataFraming([]byte(in)); got != want {
@@ -1548,7 +1548,9 @@ func TestModelRegistrationMergesDiscoveredModels(t *testing.T) {
 	}
 	var resp struct {
 		Result struct {
-			Models []struct{ ID string `json:"id"` } `json:"models"`
+			Models []struct {
+				ID string `json:"id"`
+			} `json:"models"`
 		} `json:"result"`
 	}
 	if err := json.Unmarshal(out, &resp); err != nil {
@@ -1584,7 +1586,9 @@ func TestModelRegistrationExcludesConfiguredModels(t *testing.T) {
 	}
 	var resp struct {
 		Result struct {
-			Models []struct{ ID string `json:"id"` } `json:"models"`
+			Models []struct {
+				ID string `json:"id"`
+			} `json:"models"`
 		} `json:"result"`
 	}
 	if err := json.Unmarshal(out, &resp); err != nil {

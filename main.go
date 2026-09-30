@@ -1369,39 +1369,132 @@ func runStream(req executorRequest, cfg pluginConfig, route modelRoute, baseURL 
 		}
 	}
 
+	// Track downstream activity so the heartbeat below only fires while
+	// the upstream is genuinely quiet.
+	lastEmit := time.Now()
+	baseEmit := emit
+	emit = func(frame []byte) error {
+		lastEmit = time.Now()
+		return baseEmit(frame)
+	}
+
 	reassembler := &sseReassembler{
 		rawData: rawData,
 		emit:    emit,
 	}
+
+	// Read the upstream in a goroutine so the forwarding loop can also watch
+	// a heartbeat clock: muse-class models can pause 15s+ mid-generation, and
+	// an entirely silent downstream connection gets dropped by idle-sensitive
+	// hops (NAT, proxies, client transports without pings). A no-op chat
+	// chunk (empty delta) is the standard keep-alive shape and keeps bytes on
+	// the wire without disturbing the translated stream.
+	type upstreamChunk struct {
+		chunk httpStreamChunk
+		err   error
+	}
+	chunks := make(chan upstreamChunk, 8)
+	readerDone := make(chan struct{})
+	defer close(readerDone)
+	go func() {
+		defer close(chunks)
+		for {
+			chunk, err := readHostStream(resp.StreamID)
+			if err != nil {
+				select {
+				case chunks <- upstreamChunk{err: err}:
+				case <-readerDone:
+				}
+				return
+			}
+			select {
+			case chunks <- upstreamChunk{chunk: chunk}:
+			case <-readerDone:
+				return
+			}
+			if chunk.Done || chunk.Error != "" {
+				return
+			}
+		}
+	}()
+
+	const heartbeatInterval = 10 * time.Second
+	ticker := time.NewTicker(heartbeatInterval)
+	defer ticker.Stop()
 	for {
-		chunk, err := readHostStream(resp.StreamID)
-		if err != nil {
-			closeStream(err.Error())
-			return
-		}
-		if chunk.Error != "" {
-			closeStream(chunk.Error)
-			return
-		}
-		// Process the payload before honoring Done: the host bridge may
-		// deliver the final body bytes together with the done marker in one
-		// chunk, and dropping them would truncate the tail of the answer.
-		if len(chunk.Payload) > 0 {
-			if err := reassembler.write(chunk.Payload); err != nil {
+		select {
+		case sc, ok := <-chunks:
+			if !ok {
+				// The reader ended without delivering a terminal chunk; treat
+				// whatever was buffered as the whole answer.
+				if err := reassembler.flush(); err != nil {
+					closeStream(err.Error())
+					return
+				}
+				closeStream("")
+				return
+			}
+			if sc.err != nil {
+				closeStream(sc.err.Error())
+				return
+			}
+			if sc.chunk.Error != "" {
+				closeStream(sc.chunk.Error)
+				return
+			}
+			// Process the payload before honoring Done: the host bridge may
+			// deliver the final body bytes together with the done marker in one
+			// chunk, and dropping them would truncate the tail of the answer.
+			if len(sc.chunk.Payload) > 0 {
+				if err := reassembler.write(sc.chunk.Payload); err != nil {
+					closeStream(err.Error())
+					return
+				}
+			}
+			if sc.chunk.Done {
+				// Flush any partial line and pending event before closing.
+				if err := reassembler.flush(); err != nil {
+					closeStream(err.Error())
+					return
+				}
+				closeStream("")
+				return
+			}
+		case <-ticker.C:
+			if time.Since(lastEmit) < heartbeatInterval {
+				continue
+			}
+			if err := emitHeartbeat(streamID, rawData, req.Model); err != nil {
 				closeStream(err.Error())
 				return
 			}
-		}
-		if chunk.Done {
-			// Flush any partial line and pending event before closing.
-			if err := reassembler.flush(); err != nil {
-				closeStream(err.Error())
-				return
-			}
-			break
+			lastEmit = time.Now()
 		}
 	}
-	closeStream("")
+}
+
+// emitHeartbeat forwards one no-op chat.completion.chunk downstream to keep
+// the connection warm while the upstream is quiet. The empty delta is the
+// standard keep-alive shape used by OpenAI-compatible providers.
+func emitHeartbeat(streamID string, rawData bool, model string) error {
+	payload, err := json.Marshal(map[string]any{
+		"id":      canonicalID("chatcmpl", model),
+		"object":  "chat.completion.chunk",
+		"created": time.Now().Unix(),
+		"model":   model,
+		"choices": []any{map[string]any{
+			"index":         0,
+			"delta":         map[string]any{},
+			"finish_reason": nil,
+		}},
+	})
+	if err != nil {
+		return nil
+	}
+	if rawData {
+		return emitStreamFrame(streamID, payload)
+	}
+	return emitStreamFrame(streamID, []byte("data: "+string(payload)+"\n\n"))
 }
 
 // ---------------------------------------------------------------------------
@@ -1639,10 +1732,76 @@ func responsesToChat(root map[string]any) error {
 			if !ok {
 				continue
 			}
+			itemType, _ := entry["type"].(string)
 			// Reasoning items have no chat-completions representation. The
 			// host's translation of them produces malformed messages, so drop
 			// them here when the payload arrives in responses form.
-			if itemType, _ := entry["type"].(string); strings.EqualFold(itemType, "reasoning") {
+			if strings.EqualFold(itemType, "reasoning") {
+				continue
+			}
+			// Tool traffic in responses form (function_call /
+			// function_call_output, plus the custom_tool variants) carries no
+			// "role" field. Letting it fall through to the generic role copy
+			// below produced roleless messages that sanitizeChatMessages then
+			// dropped, silently erasing the whole tool history: the upstream
+			// model never saw its own tool calls or any tool results and
+			// re-issued the same calls every turn (agent loops). Convert them
+			// to their chat-completions equivalents instead.
+			if strings.EqualFold(itemType, "function_call") || strings.EqualFold(itemType, "custom_tool_call") {
+				callID, _ := entry["call_id"].(string)
+				if callID == "" {
+					callID, _ = entry["id"].(string)
+				}
+				name, _ := entry["name"].(string)
+				arguments, _ := entry["arguments"].(string)
+				if arguments == "" {
+					if raw := entry["input"]; raw != nil {
+						if s, ok := raw.(string); ok {
+							arguments = s
+						} else if b, err := json.Marshal(raw); err == nil {
+							arguments = string(b)
+						}
+					}
+				}
+				call := map[string]any{
+					"id":   callID,
+					"type": "function",
+					"function": map[string]any{
+						"name":      name,
+						"arguments": arguments,
+					},
+				}
+				// Parallel calls arrive as consecutive function_call items;
+				// merge them into one assistant message (the canonical
+				// chat-completions shape) instead of emitting several
+				// back-to-back assistant messages.
+				if n := len(messages); n > 0 {
+					if prev, ok := messages[n-1].(map[string]any); ok {
+						if role, _ := prev["role"].(string); role == "assistant" {
+							if calls, ok := prev["tool_calls"].([]any); ok {
+								prev["tool_calls"] = append(calls, call)
+								continue
+							}
+						}
+					}
+				}
+				messages = append(messages, map[string]any{
+					"role":       "assistant",
+					"content":    "",
+					"tool_calls": []any{call},
+				})
+				continue
+			}
+			if strings.EqualFold(itemType, "function_call_output") || strings.EqualFold(itemType, "custom_tool_call_output") {
+				callID, _ := entry["call_id"].(string)
+				if callID == "" {
+					callID, _ = entry["id"].(string)
+				}
+				messages = append(messages, map[string]any{
+					"role":         "tool",
+					"tool_call_id": callID,
+					"content":      toolOutputContent(entry["output"]),
+				})
 				continue
 			}
 			message := map[string]any{"role": entry["role"]}
@@ -1669,6 +1828,38 @@ func responsesToChat(root map[string]any) error {
 		delete(root, "text")
 	}
 	return nil
+}
+
+// toolOutputContent flattens a responses function_call_output "output"
+// value into the string content a chat-completions tool message expects.
+// The spec shape is a plain string, but some clients send an object with a
+// content field; both are handled.
+func toolOutputContent(output any) string {
+	switch o := output.(type) {
+	case string:
+		return o
+	case nil:
+		return ""
+	case map[string]any:
+		if content, ok := o["content"]; ok && content != nil {
+			if s, ok := content.(string); ok {
+				return s
+			}
+			if b, err := json.Marshal(content); err == nil {
+				return string(b)
+			}
+			return ""
+		}
+		if b, err := json.Marshal(o); err == nil {
+			return string(b)
+		}
+		return ""
+	default:
+		if b, err := json.Marshal(o); err == nil {
+			return string(b)
+		}
+		return ""
+	}
 }
 
 // renamePartType rewrites content parts whose "type" matches one of
@@ -1773,9 +1964,69 @@ func chatToResponses(root map[string]any) error {
 		if !ok {
 			continue
 		}
-		message := map[string]any{"role": entry["role"]}
+		role, _ := entry["role"].(string)
+
+		// Tool result messages become function_call_output items; a bare
+		// {"role":"tool"} object is not a valid responses input item and the
+		// tool result would be lost.
+		if role == "tool" {
+			callID, _ := entry["tool_call_id"].(string)
+			content := ""
+			switch c := entry["content"].(type) {
+			case string:
+				content = c
+			case nil:
+			default:
+				if b, err := json.Marshal(c); err == nil {
+					content = string(b)
+				}
+			}
+			input = append(input, map[string]any{
+				"type":    "function_call_output",
+				"call_id": callID,
+				"output":  content,
+			})
+			continue
+		}
+
+		// Assistant tool invocations become function_call items; dropping
+		// tool_calls here would erase the model's own calls from history.
+		if role == "assistant" {
+			if calls, ok := entry["tool_calls"].([]any); ok && len(calls) > 0 {
+				if text, ok := entry["content"].(string); ok && strings.TrimSpace(text) != "" {
+					input = append(input, map[string]any{
+						"type":    "message",
+						"role":    "assistant",
+						"content": []any{map[string]any{"type": "output_text", "text": text}},
+					})
+				}
+				for _, c := range calls {
+					call, ok := c.(map[string]any)
+					if !ok {
+						continue
+					}
+					callID, _ := call["id"].(string)
+					fn, _ := call["function"].(map[string]any)
+					name, _ := fn["name"].(string)
+					arguments, _ := fn["arguments"].(string)
+					input = append(input, map[string]any{
+						"type":      "function_call",
+						"call_id":   callID,
+						"name":      name,
+						"arguments": arguments,
+					})
+				}
+				continue
+			}
+		}
+
+		message := map[string]any{"type": "message", "role": entry["role"]}
 		if content, ok := entry["content"]; ok {
-			message["content"] = renamePartType(content, "input_text", "text")
+			if role == "assistant" {
+				message["content"] = renamePartType(content, "output_text", "text")
+			} else {
+				message["content"] = renamePartType(content, "input_text", "text")
+			}
 		}
 		input = append(input, message)
 	}
@@ -2545,24 +2796,34 @@ func sseFrames(sse []byte) []string {
 // responsesChatStreamConverter converts Responses API stream events into
 // chat.completion.chunk payloads, statefully.
 type responsesChatStreamConverter struct {
-	model    string
-	id       string
-	created  int64
-	sawDelta map[string]bool
+	model     string
+	id        string
+	created   int64
+	sawDelta  map[string]bool
+	toolIdx   map[string]int // responses item id -> chat tool_calls index
+	nextTool  int
+	toolArgs  map[string]bool // item id -> arguments already streamed
+	toolCallN int
 }
 
 func newResponsesChatStreamConverter(model string) *responsesChatStreamConverter {
-	return &responsesChatStreamConverter{model: model, sawDelta: map[string]bool{}}
+	return &responsesChatStreamConverter{
+		model:    model,
+		sawDelta: map[string]bool{},
+		toolIdx:  map[string]int{},
+		toolArgs: map[string]bool{},
+	}
 }
 
 // convert maps one SSE payload (responses event JSON, framing stripped) to
 // zero or more chat chunk JSON payloads. A non-JSON payload is dropped.
 func (c *responsesChatStreamConverter) convert(payload []byte) ([][]byte, error) {
 	var ev struct {
-		Type     string `json:"type"`
-		ItemID   string `json:"item_id"`
-		Delta    string `json:"delta"`
-		Response struct {
+		Type      string `json:"type"`
+		ItemID    string `json:"item_id"`
+		Delta     string `json:"delta"`
+		Arguments string `json:"arguments"`
+		Response  struct {
 			ID        string `json:"id"`
 			CreatedAt int64  `json:"created_at"`
 			Status    string `json:"status"`
@@ -2576,9 +2837,12 @@ func (c *responsesChatStreamConverter) convert(payload []byte) ([][]byte, error)
 			} `json:"usage"`
 		} `json:"response"`
 		Item struct {
-			ID      string `json:"id"`
-			Type    string `json:"type"`
-			Content []struct {
+			ID        string `json:"id"`
+			Type      string `json:"type"`
+			CallID    string `json:"call_id"`
+			Name      string `json:"name"`
+			Arguments string `json:"arguments"`
+			Content   []struct {
 				Type string `json:"type"`
 				Text string `json:"text"`
 			} `json:"content"`
@@ -2596,6 +2860,64 @@ func (c *responsesChatStreamConverter) convert(payload []byte) ([][]byte, error)
 			c.created = ev.Response.CreatedAt
 		}
 		return [][]byte{c.chunk(map[string]any{"role": "assistant"}, nil, nil)}, nil
+	case "response.output_item.added":
+		// A function_call item announces the tool invocation: emit the
+		// chat-completions tool_calls head (id + name, empty arguments) so
+		// downstream translators can map it to a function_call item.
+		if ev.Item.Type == "function_call" {
+			idx := c.toolIndexFor(ev.Item.ID)
+			c.toolCallN++
+			id := ev.Item.CallID
+			if id == "" {
+				id = ev.Item.ID
+			}
+			return [][]byte{c.chunk(map[string]any{
+				"tool_calls": []any{map[string]any{
+					"index": idx,
+					"id":    id,
+					"type":  "function",
+					"function": map[string]any{
+						"name":      ev.Item.Name,
+						"arguments": "",
+					},
+				}},
+			}, nil, nil)}, nil
+		}
+		return nil, nil
+	case "response.function_call_arguments.delta":
+		if ev.ItemID != "" {
+			c.sawDelta[ev.ItemID] = true
+			c.toolArgs[ev.ItemID] = true
+		}
+		if ev.Delta == "" {
+			return nil, nil
+		}
+		return [][]byte{c.chunk(map[string]any{
+			"tool_calls": []any{map[string]any{
+				"index": c.toolIndexFor(ev.ItemID),
+				"function": map[string]any{
+					"arguments": ev.Delta,
+				},
+			}},
+		}, nil, nil)}, nil
+	case "response.function_call_arguments.done":
+		// Upstreams that do not stream argument fragments deliver the full
+		// argument string once here; emit it unless deltas already covered it.
+		if ev.ItemID != "" && !c.toolArgs[ev.ItemID] {
+			c.toolArgs[ev.ItemID] = true
+			c.sawDelta[ev.ItemID] = true
+			if ev.Arguments != "" {
+				return [][]byte{c.chunk(map[string]any{
+					"tool_calls": []any{map[string]any{
+						"index": c.toolIndexFor(ev.ItemID),
+						"function": map[string]any{
+							"arguments": ev.Arguments,
+						},
+					}},
+				}, nil, nil)}, nil
+			}
+		}
+		return nil, nil
 	case "response.output_text.delta":
 		if ev.ItemID != "" {
 			c.sawDelta[ev.ItemID] = true
@@ -2615,6 +2937,29 @@ func (c *responsesChatStreamConverter) convert(payload []byte) ([][]byte, error)
 	case "response.output_item.done":
 		// Fallback: an item completed without streamed deltas (some upstreams
 		// only send the final item). Emit its text once.
+		if ev.Item.Type == "function_call" {
+			if ev.Item.ID == "" || c.sawDelta[ev.Item.ID] {
+				return nil, nil
+			}
+			c.sawDelta[ev.Item.ID] = true
+			c.toolArgs[ev.Item.ID] = true
+			c.toolCallN++
+			id := ev.Item.CallID
+			if id == "" {
+				id = ev.Item.ID
+			}
+			return [][]byte{c.chunk(map[string]any{
+				"tool_calls": []any{map[string]any{
+					"index": c.toolIndexFor(ev.Item.ID),
+					"id":    id,
+					"type":  "function",
+					"function": map[string]any{
+						"name":      ev.Item.Name,
+						"arguments": ev.Item.Arguments,
+					},
+				}},
+			}, nil, nil)}, nil
+		}
 		if ev.Item.Type != "message" || ev.Item.ID == "" || c.sawDelta[ev.Item.ID] {
 			return nil, nil
 		}
@@ -2637,7 +2982,11 @@ func (c *responsesChatStreamConverter) convert(payload []byte) ([][]byte, error)
 				"total_tokens":      ev.Response.Usage.TotalTokens,
 			}
 		}
-		return [][]byte{c.chunk(map[string]any{}, strPtr("stop"), usage)}, nil
+		finish := "stop"
+		if c.toolCallN > 0 {
+			finish = "tool_calls"
+		}
+		return [][]byte{c.chunk(map[string]any{}, strPtr(finish), usage)}, nil
 	case "response.failed", "response.incomplete":
 		msg := "upstream response " + ev.Type
 		if ev.Response.Error != nil && ev.Response.Error.Message != "" {
@@ -2648,6 +2997,18 @@ func (c *responsesChatStreamConverter) convert(payload []byte) ([][]byte, error)
 		return nil, fmt.Errorf("zen responses stream failed: %s", msg)
 	}
 	return nil, nil
+}
+
+// toolIndexFor maps a responses item id to a stable chat tool_calls index,
+// assigning the next slot on first sight.
+func (c *responsesChatStreamConverter) toolIndexFor(itemID string) int {
+	if idx, ok := c.toolIdx[itemID]; ok {
+		return idx
+	}
+	idx := c.nextTool
+	c.nextTool++
+	c.toolIdx[itemID] = idx
+	return idx
 }
 
 // chunk renders one chat.completion.chunk payload.
@@ -2690,9 +3051,12 @@ func responsesCompletionToChat(body []byte, model string) ([]byte, error) {
 		Status    string `json:"status"`
 		CreatedAt int64  `json:"created_at"`
 		Output    []struct {
-			Type    string `json:"type"`
-			Role    string `json:"role"`
-			Content []struct {
+			Type      string `json:"type"`
+			Role      string `json:"role"`
+			CallID    string `json:"call_id"`
+			Name      string `json:"name"`
+			Arguments string `json:"arguments"`
+			Content   []struct {
 				Type string `json:"type"`
 				Text string `json:"text"`
 			} `json:"content"`
@@ -2721,6 +3085,7 @@ func responsesCompletionToChat(body []byte, model string) ([]byte, error) {
 		return nil, fmt.Errorf("zen responses stream failed: %s", msg)
 	}
 	var content, reasoning strings.Builder
+	var toolCalls []any
 	for _, item := range resp.Output {
 		switch item.Type {
 		case "message":
@@ -2733,6 +3098,21 @@ func responsesCompletionToChat(body []byte, model string) ([]byte, error) {
 			for _, sum := range item.Summary {
 				reasoning.WriteString(sum.Text)
 			}
+		case "function_call":
+			// Tool invocations must survive the responses -> chat fold, or
+			// agent clients never see the model's tool calls.
+			id := item.CallID
+			if id == "" {
+				id = canonicalID("call", item.Name+item.Arguments)
+			}
+			toolCalls = append(toolCalls, map[string]any{
+				"id":   id,
+				"type": "function",
+				"function": map[string]any{
+					"name":      item.Name,
+					"arguments": item.Arguments,
+				},
+			})
 		}
 	}
 	if resp.Model != "" {
@@ -2750,6 +3130,11 @@ func responsesCompletionToChat(body []byte, model string) ([]byte, error) {
 	if reasoning.Len() > 0 {
 		message["reasoning_content"] = reasoning.String()
 	}
+	finish := "stop"
+	if len(toolCalls) > 0 {
+		message["tool_calls"] = toolCalls
+		finish = "tool_calls"
+	}
 	m := map[string]any{
 		"id":      id,
 		"object":  "chat.completion",
@@ -2758,7 +3143,7 @@ func responsesCompletionToChat(body []byte, model string) ([]byte, error) {
 		"choices": []any{map[string]any{
 			"index":         0,
 			"message":       message,
-			"finish_reason": "stop",
+			"finish_reason": finish,
 		}},
 	}
 	if resp.Usage != nil {

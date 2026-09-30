@@ -171,6 +171,8 @@ curl -s -N http://localhost:8080/backend-api/codex/responses \
 
 | 现象 | 原因与解决 |
 |---|---|
+| agent 客户端（pi 等）模型反复执行同一条命令、读不存在的文件 | 插件 ≤0.7.3 在 Responses→chat 转换时丢弃了 `function_call` / `function_call_output` 历史项，模型每轮看不到自己之前的工具调用与结果。升级到 **0.7.4+**。 |
+| muse 模型工具调用无响应 / 空回复 | 插件 ≤0.7.3 的流转换器丢弃了 `function_call` 事件，agent 客户端收不到工具调用。升级到 **0.7.4+**。 |
 | `auth_not_found: no auth available (providers=zen...)` | 插件 ≤0.7.1 在 CPA v8 上无法识别 `auth.parse` 的 `RawJSON` 载荷。升级到 **0.7.2+**；或手动在 auth 目录放凭证文件。 |
 | 上游 `401` / 流中断（`upstream stream closed before a terminal event`） | `api-keys` 里多个 key 用了分号等非逗号分隔符，被拼成一个无效 key。升级 **0.7.3+**（支持逗号/分号/空白分隔），并删除已生成的坏凭证文件（管理中心凭证页可删）。 |
 | `429 FreeUsageLimitError: Rate limit exceeded` | Zen 对服务器 IP 的风控。配置全局 `proxy-url` 走代理（见上文代理章节），或等待冷却后重试。 |
@@ -181,6 +183,11 @@ curl -s -N http://localhost:8080/backend-api/codex/responses \
 
 ## 版本历史
 
+- **0.7.4**：修复 agent 客户端（pi / Codex 等 Responses 协议）多轮工具调用历史丢失的严重问题：
+  - 请求方向：`function_call` / `function_call_output` 历史项在转换为 chat 格式时被静默丢弃，导致上游模型每轮“失忆”、重复执行相同工具调用（agent 死循环）。
+  - 反向（chat 客户端 → responses 模型）：assistant 的 `tool_calls` 与 `role:"tool"` 结果消息同样丢失，现已转换为规范的 `function_call` / `function_call_output` 项。
+  - 响应方向：muse 等 /responses 端点模型的 `function_call` 事件现在会转换为 chat `tool_calls` 增量帧（流式）与 `message.tool_calls`（非流式），agent 客户端终于能看到 muse 的工具调用。
+  - 流空闲心跳：上游静默期间每 10 秒向下游发送 no-op `chat.completion.chunk`，防止 muse 等慢模型长思考时连接被中间层（NAT/代理/客户端传输层）掐断。
 - **0.7.3**：`api-keys` / `exclude-models` 支持逗号、分号、空白多种分隔符（修复管理面板填分号导致 401 的问题）。
 - **0.7.2**：适配 CPA v8 `auth.parse` 的 `RawJSON` 载荷格式；配置的 `api-keys` 自动落盘为标准凭证文件（`host.auth.save`）。
 - **0.7.1**：管理面板新增 `api-keys`、`exclude-models` 配置字段。

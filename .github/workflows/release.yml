@@ -40,6 +40,7 @@ jobs:
           go mod tidy
           go mod verify
           go vet ./...
+          go test ./...
 
       - name: Resolve version
         id: ver
