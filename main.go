@@ -87,7 +87,7 @@ const (
 	defaultUserAgent = "opencode/1.18.31 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14"
 )
 
-var pluginVersion = "0.5.0"
+var pluginVersion = "0.5.1"
 
 var (
 	canonicalSessionRe = regexp.MustCompile(`^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$`)
@@ -1028,42 +1028,36 @@ func runStream(req executorRequest, cfg pluginConfig, route modelRoute, endpoint
 	src := strings.ToLower(strings.TrimSpace(req.SourceFormat))
 	rawData := src == "openai" || strings.Contains(src, "chat")
 
-	var lineBuf bytes.Buffer
+	reassembler := &sseReassembler{
+		rawData: rawData,
+		emit:    func(frame []byte) error { return emitStreamFrame(streamID, frame) },
+	}
 	for {
 		chunk, err := readHostStream(resp.StreamID)
 		if err != nil {
 			closeStream(err.Error())
 			return
 		}
-		if chunk.Done {
-			// Flush any trailing line in buffer before closing
-			if lineBuf.Len() > 0 {
-				_ = emitStreamChunk(streamID, lineBuf.Bytes(), rawData)
-				lineBuf.Reset()
-			}
-			break
-		}
 		if chunk.Error != "" {
 			closeStream(chunk.Error)
 			return
 		}
+		// Process the payload before honoring Done: the host bridge may
+		// deliver the final body bytes together with the done marker in one
+		// chunk, and dropping them would truncate the tail of the answer.
 		if len(chunk.Payload) > 0 {
-			lineBuf.Write(chunk.Payload)
-			for {
-				data := lineBuf.Bytes()
-				idx := bytes.IndexByte(data, '\n')
-				if idx < 0 {
-					break
-				}
-				line := make([]byte, idx)
-				copy(line, data[:idx])
-				lineBuf.Next(idx + 1)
-
-				if err := emitStreamChunk(streamID, line, rawData); err != nil {
-					closeStream(err.Error())
-					return
-				}
+			if err := reassembler.write(chunk.Payload); err != nil {
+				closeStream(err.Error())
+				return
 			}
+		}
+		if chunk.Done {
+			// Flush any partial line and pending event before closing.
+			if err := reassembler.flush(); err != nil {
+				closeStream(err.Error())
+				return
+			}
+			break
 		}
 	}
 	closeStream("")
@@ -1852,12 +1846,9 @@ func readHostStream(streamID string) (httpStreamChunk, error) {
 	return chunk, nil
 }
 
-// emitStreamChunk forwards one payload frame through the plugin stream bridge.
-// When rawData is true the payload is emitted as the bare data value and the
-// host applies the SSE framing; otherwise a complete SSE frame is emitted for
-// the host response translator.
-func emitStreamChunk(streamID string, payload []byte, rawData bool) error {
-	frame := normalizeSSEFrame(rawData, payload)
+// emitStreamFrame forwards one prepared payload frame through the plugin
+// stream bridge.
+func emitStreamFrame(streamID string, frame []byte) error {
 	if len(frame) == 0 {
 		return nil
 	}
@@ -1866,6 +1857,93 @@ func emitStreamChunk(streamID string, payload []byte, rawData bool) error {
 		"payload":   frame,
 	})
 	return err
+}
+
+// sseReassembler turns chunked upstream SSE bytes into complete plugin
+// stream emissions. It buffers partial lines across chunk boundaries and
+// reassembles the data fields of one event per the SSE specification
+// (multiple "data:" lines of an event are joined with "\n") before
+// emitting, so a payload split across several data lines reaches the
+// client as one frame instead of invalid fragments.
+type sseReassembler struct {
+	rawData bool
+	lineBuf bytes.Buffer
+	pending []string // data payloads of the event currently being assembled
+	emit    func(frame []byte) error
+}
+
+// write feeds one upstream chunk into the reassembler.
+func (r *sseReassembler) write(p []byte) error {
+	r.lineBuf.Write(p)
+	for {
+		data := r.lineBuf.Bytes()
+		idx := bytes.IndexByte(data, '\n')
+		if idx < 0 {
+			return nil
+		}
+		line := make([]byte, idx)
+		copy(line, data[:idx])
+		r.lineBuf.Next(idx + 1)
+		if err := r.handleLine(line); err != nil {
+			return err
+		}
+	}
+}
+
+// flush emits any buffered partial line and the pending event. It must be
+// called once the upstream stream is finished so the tail of the answer is
+// never dropped.
+func (r *sseReassembler) flush() error {
+	if r.lineBuf.Len() > 0 {
+		line := make([]byte, r.lineBuf.Len())
+		copy(line, r.lineBuf.Bytes())
+		r.lineBuf.Reset()
+		if err := r.handleLine(line); err != nil {
+			return err
+		}
+	}
+	return r.flushPending()
+}
+
+// handleLine processes one complete SSE line.
+func (r *sseReassembler) handleLine(line []byte) error {
+	s := strings.TrimSpace(strings.TrimRight(string(line), "\r"))
+	if s == "" {
+		// A blank line terminates the current event.
+		return r.flushPending()
+	}
+	if after, ok := strings.CutPrefix(s, "data:"); ok {
+		payload := strings.TrimLeft(after, " \t")
+		if payload == "" || strings.HasPrefix(payload, ":") {
+			return nil
+		}
+		r.pending = append(r.pending, payload)
+		return nil
+	}
+	// Non-data lines flush the pending event first to preserve ordering,
+	// then keep the single-line passthrough behavior (comments dropped,
+	// event/id/retry and bare JSON lines normalized).
+	if err := r.flushPending(); err != nil {
+		return err
+	}
+	frame := normalizeSSEFrame(r.rawData, []byte(s))
+	if len(frame) == 0 {
+		return nil
+	}
+	return r.emit(frame)
+}
+
+// flushPending emits the joined data payload of the current event.
+func (r *sseReassembler) flushPending() error {
+	if len(r.pending) == 0 {
+		return nil
+	}
+	joined := strings.Join(r.pending, "\n")
+	r.pending = nil
+	if r.rawData {
+		return r.emit([]byte(joined))
+	}
+	return r.emit([]byte("data: " + joined + "\n\n"))
 }
 
 // normalizeSSEFrame converts one upstream SSE line into the payload to

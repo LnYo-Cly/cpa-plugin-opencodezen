@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"encoding/json"
 	"regexp"
 	"strings"
@@ -1152,33 +1151,28 @@ func TestLineBufferReassembly(t *testing.T) {
 	part1 := []byte("data: {\"id\":\"123\",")
 	part2 := []byte("\"content\":\"hello\"}\n: keep-alive\ndata: [DONE]\n")
 
-	var lineBuf bytes.Buffer
 	var emitted [][]byte
-
-	feed := func(chunk []byte) {
-		lineBuf.Write(chunk)
-		for {
-			data := lineBuf.Bytes()
-			idx := bytes.IndexByte(data, '\n')
-			if idx < 0 {
-				break
-			}
-			line := make([]byte, idx)
-			copy(line, data[:idx])
-			lineBuf.Next(idx + 1)
-
-			if s := normalizeSSEFrame(false, line); len(s) > 0 {
-				emitted = append(emitted, s)
-			}
-		}
+	r := &sseReassembler{
+		rawData: false,
+		emit:    func(frame []byte) error { emitted = append(emitted, frame); return nil },
 	}
 
-	feed(part1)
+	if err := r.write(part1); err != nil {
+		t.Fatal(err)
+	}
 	if len(emitted) != 0 {
 		t.Fatalf("expected 0 emitted lines while line is incomplete, got %d", len(emitted))
 	}
 
-	feed(part2)
+	if err := r.write(part2); err != nil {
+		t.Fatal(err)
+	}
+	// Stream finished: flush the pending [DONE] event (no trailing blank
+	// line in this input, mirroring a done marker arriving with the last
+	// payload bytes).
+	if err := r.flush(); err != nil {
+		t.Fatal(err)
+	}
 	// Should produce 2 valid outputs: the reassembled JSON and [DONE]
 	// The : keep-alive should be dropped
 	if len(emitted) != 2 {
@@ -1190,5 +1184,105 @@ func TestLineBufferReassembly(t *testing.T) {
 	}
 	if string(emitted[1]) != "data: [DONE]\n\n" {
 		t.Fatalf("unexpected line 1: %q", string(emitted[1]))
+	}
+}
+
+func TestSSEReassemblerJoinsMultiLineData(t *testing.T) {
+	var emitted [][]byte
+	r := &sseReassembler{
+		rawData: false,
+		emit:    func(frame []byte) error { emitted = append(emitted, frame); return nil },
+	}
+	// One event whose JSON is split across two data lines (SSE-legal):
+	// the payloads must be joined with "\n" into a single frame.
+	if err := r.write([]byte("data: {\"id\":\"1\",\n")); err != nil {
+		t.Fatal(err)
+	}
+	if len(emitted) != 0 {
+		t.Fatalf("expected 0 frames while event is incomplete, got %d", len(emitted))
+	}
+	if err := r.write([]byte("data: \"content\":\"hi\"}\n\n")); err != nil {
+		t.Fatal(err)
+	}
+	if len(emitted) != 1 {
+		t.Fatalf("expected 1 joined frame, got %d: %v", len(emitted), emitted)
+	}
+	want := "data: {\"id\":\"1\",\n\"content\":\"hi\"}\n\n"
+	if string(emitted[0]) != want {
+		t.Fatalf("unexpected frame: %q, want %q", string(emitted[0]), want)
+	}
+}
+
+func TestSSEReassemblerRawModeEmitsBarePayloads(t *testing.T) {
+	var emitted [][]byte
+	r := &sseReassembler{
+		rawData: true,
+		emit:    func(frame []byte) error { emitted = append(emitted, frame); return nil },
+	}
+	input := "data: {\"choices\":[]}\n\ndata: [DONE]\n\n"
+	if err := r.write([]byte(input)); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.flush(); err != nil {
+		t.Fatal(err)
+	}
+	if len(emitted) != 2 {
+		t.Fatalf("expected 2 frames, got %d: %v", len(emitted), emitted)
+	}
+	if string(emitted[0]) != "{\"choices\":[]}" {
+		t.Fatalf("unexpected frame 0: %q", string(emitted[0]))
+	}
+	if string(emitted[1]) != "[DONE]" {
+		t.Fatalf("unexpected frame 1: %q", string(emitted[1]))
+	}
+}
+
+func TestSSEReassemblerFlushKeepsTailWithoutTrailingNewline(t *testing.T) {
+	// Simulates the host bridge delivering the final body bytes together
+	// with the done marker: the stream ends without a trailing blank line
+	// and the last event must still reach the client.
+	var emitted [][]byte
+	r := &sseReassembler{
+		rawData: true,
+		emit:    func(frame []byte) error { emitted = append(emitted, frame); return nil },
+	}
+	if err := r.write([]byte("data: {\"a\":1}\n\ndata: {\"b\":2}")); err != nil {
+		t.Fatal(err)
+	}
+	if len(emitted) != 1 {
+		t.Fatalf("expected 1 frame before flush, got %d", len(emitted))
+	}
+	if err := r.flush(); err != nil {
+		t.Fatal(err)
+	}
+	if len(emitted) != 2 {
+		t.Fatalf("expected 2 frames after flush, got %d: %v", len(emitted), emitted)
+	}
+	if string(emitted[1]) != "{\"b\":2}" {
+		t.Fatalf("unexpected tail frame: %q", string(emitted[1]))
+	}
+}
+
+func TestSSEReassemblerCRLFAndKeepAlive(t *testing.T) {
+	var emitted [][]byte
+	r := &sseReassembler{
+		rawData: false,
+		emit:    func(frame []byte) error { emitted = append(emitted, frame); return nil },
+	}
+	input := "data: {\"x\":1}\r\n\r\n: keep-alive\r\n\r\ndata: [DONE]\r\n\r\n"
+	if err := r.write([]byte(input)); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.flush(); err != nil {
+		t.Fatal(err)
+	}
+	if len(emitted) != 2 {
+		t.Fatalf("expected 2 frames, got %d: %v", len(emitted), emitted)
+	}
+	if string(emitted[0]) != "data: {\"x\":1}\n\n" {
+		t.Fatalf("unexpected frame 0: %q", string(emitted[0]))
+	}
+	if string(emitted[1]) != "data: [DONE]\n\n" {
+		t.Fatalf("unexpected frame 1: %q", string(emitted[1]))
 	}
 }
