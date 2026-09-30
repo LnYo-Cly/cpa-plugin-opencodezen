@@ -88,7 +88,7 @@ const (
 	defaultUserAgent = "opencode/1.18.31 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14"
 )
 
-var pluginVersion = "0.6.0"
+var pluginVersion = "0.6.1"
 
 var (
 	canonicalSessionRe = regexp.MustCompile(`^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$`)
@@ -1406,7 +1406,12 @@ func responsesToolsToChat(tools []any) []any {
 			out = append(out, item)
 			continue
 		}
-		if _, ok := tool["function"].(map[string]any); ok {
+		if fn, ok := tool["function"].(map[string]any); ok {
+			for k, v := range fn {
+				if v == nil {
+					delete(fn, k)
+				}
+			}
 			out = append(out, tool)
 			continue
 		}
@@ -1423,6 +1428,12 @@ func responsesToolsToChat(tools []any) []any {
 					continue
 				}
 				fn[k] = v
+			}
+		}
+		// zen rejects "strict": null (pi sends it on every tool); drop null-valued keys.
+		for k, v := range fn {
+			if v == nil {
+				delete(fn, k)
 			}
 		}
 		converted := map[string]any{"type": "function", "function": fn}

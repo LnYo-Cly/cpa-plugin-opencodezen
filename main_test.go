@@ -1464,3 +1464,23 @@ func TestStripSSEDataFraming(t *testing.T) {
 		}
 	}
 }
+
+func TestResponsesToolsToChatStripsNullFields(t *testing.T) {
+	tools := []any{
+		map[string]any{"type": "function", "name": "read", "description": "Read a file",
+			"parameters": map[string]any{"type": "object"}, "strict": nil},
+		map[string]any{"type": "function", "function": map[string]any{
+			"name": "write", "strict": nil, "description": "d"}},
+	}
+	out := responsesToolsToChat(tools)
+	for _, item := range out {
+		tool := item.(map[string]any)
+		fn, _ := tool["function"].(map[string]any)
+		if fn == nil {
+			t.Fatalf("missing function wrapper: %v", tool)
+		}
+		if _, ok := fn["strict"]; ok {
+			t.Fatalf("strict survived conversion: %v", fn)
+		}
+	}
+}
