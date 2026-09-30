@@ -87,7 +87,7 @@ const (
 	defaultUserAgent = "opencode/1.18.31 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14"
 )
 
-var pluginVersion = "0.5.1"
+var pluginVersion = "0.5.2"
 
 var (
 	canonicalSessionRe = regexp.MustCompile(`^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$`)
@@ -1847,9 +1847,15 @@ func readHostStream(streamID string) (httpStreamChunk, error) {
 }
 
 // emitStreamFrame forwards one prepared payload frame through the plugin
-// stream bridge.
+// stream bridge. "[DONE]" terminators are dropped: the host appends its own
+// done tail after the plugin stream closes (adapters_executors.go
+// emitTranslatedExecutorStreamTail / executorStreamDonePayload), so
+// forwarding the upstream terminator would duplicate it.
 func emitStreamFrame(streamID string, frame []byte) error {
 	if len(frame) == 0 {
+		return nil
+	}
+	if s := strings.TrimSpace(string(frame)); s == "[DONE]" || s == "data: [DONE]" {
 		return nil
 	}
 	_, err := callHost("host.stream.emit", map[string]any{
@@ -1927,23 +1933,35 @@ func (r *sseReassembler) handleLine(line []byte) error {
 		return err
 	}
 	frame := normalizeSSEFrame(r.rawData, []byte(s))
-	if len(frame) == 0 {
+	if len(frame) == 0 || isDoneTerminator(string(frame)) {
 		return nil
 	}
 	return r.emit(frame)
 }
 
 // flushPending emits the joined data payload of the current event.
+// "[DONE]" terminators are dropped: the host appends its own done tail
+// after the plugin stream closes, so forwarding the upstream terminator
+// would duplicate it.
 func (r *sseReassembler) flushPending() error {
 	if len(r.pending) == 0 {
 		return nil
 	}
 	joined := strings.Join(r.pending, "\n")
 	r.pending = nil
+	if isDoneTerminator(joined) {
+		return nil
+	}
 	if r.rawData {
 		return r.emit([]byte(joined))
 	}
 	return r.emit([]byte("data: " + joined + "\n\n"))
+}
+
+// isDoneTerminator reports whether a payload is an SSE [DONE] terminator.
+func isDoneTerminator(s string) bool {
+	s = strings.TrimSpace(s)
+	return s == "[DONE]" || s == "data: [DONE]"
 }
 
 // normalizeSSEFrame converts one upstream SSE line into the payload to

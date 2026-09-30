@@ -1167,23 +1167,21 @@ func TestLineBufferReassembly(t *testing.T) {
 	if err := r.write(part2); err != nil {
 		t.Fatal(err)
 	}
-	// Stream finished: flush the pending [DONE] event (no trailing blank
+	// Stream finished: flush the pending event (no trailing blank
 	// line in this input, mirroring a done marker arriving with the last
 	// payload bytes).
 	if err := r.flush(); err != nil {
 		t.Fatal(err)
 	}
-	// Should produce 2 valid outputs: the reassembled JSON and [DONE]
-	// The : keep-alive should be dropped
-	if len(emitted) != 2 {
-		t.Fatalf("expected 2 emitted frames, got %d: %v", len(emitted), emitted)
+	// The reassembled JSON is the only emitted frame: the [DONE] terminator
+	// is dropped here because the host appends its own done tail after the
+	// plugin stream closes, and the keep-alive comment is ignored.
+	if len(emitted) != 1 {
+		t.Fatalf("expected 1 emitted frame, got %d: %v", len(emitted), emitted)
 	}
 
 	if string(emitted[0]) != "data: {\"id\":\"123\",\"content\":\"hello\"}\n\n" {
 		t.Fatalf("unexpected line 0: %q", string(emitted[0]))
-	}
-	if string(emitted[1]) != "data: [DONE]\n\n" {
-		t.Fatalf("unexpected line 1: %q", string(emitted[1]))
 	}
 }
 
@@ -1226,14 +1224,13 @@ func TestSSEReassemblerRawModeEmitsBarePayloads(t *testing.T) {
 	if err := r.flush(); err != nil {
 		t.Fatal(err)
 	}
-	if len(emitted) != 2 {
-		t.Fatalf("expected 2 frames, got %d: %v", len(emitted), emitted)
+	// Only the JSON payload is emitted; [DONE] is dropped because the host
+	// appends its own done tail after the plugin stream closes.
+	if len(emitted) != 1 {
+		t.Fatalf("expected 1 frame, got %d: %v", len(emitted), emitted)
 	}
 	if string(emitted[0]) != "{\"choices\":[]}" {
 		t.Fatalf("unexpected frame 0: %q", string(emitted[0]))
-	}
-	if string(emitted[1]) != "[DONE]" {
-		t.Fatalf("unexpected frame 1: %q", string(emitted[1]))
 	}
 }
 
@@ -1263,6 +1260,23 @@ func TestSSEReassemblerFlushKeepsTailWithoutTrailingNewline(t *testing.T) {
 	}
 }
 
+func TestEmitStreamFrameDropsDoneTerminator(t *testing.T) {
+	// The host appends its own done tail after the plugin stream closes;
+	// forwarding the upstream terminator would duplicate it.
+	done := []string{"[DONE]", "data: [DONE]", "data: [DONE]\n\n", " [DONE] \t"}
+	for _, s := range done {
+		if !isDoneTerminator(s) {
+			t.Fatalf("%q should be recognized as a done terminator", s)
+		}
+	}
+	notDone := []string{"data: {}", "data: {\"a\":1}", "", "[DONEX]"}
+	for _, s := range notDone {
+		if isDoneTerminator(s) {
+			t.Fatalf("%q should NOT be recognized as a done terminator", s)
+		}
+	}
+}
+
 func TestSSEReassemblerCRLFAndKeepAlive(t *testing.T) {
 	var emitted [][]byte
 	r := &sseReassembler{
@@ -1276,13 +1290,11 @@ func TestSSEReassemblerCRLFAndKeepAlive(t *testing.T) {
 	if err := r.flush(); err != nil {
 		t.Fatal(err)
 	}
-	if len(emitted) != 2 {
-		t.Fatalf("expected 2 frames, got %d: %v", len(emitted), emitted)
+	// [DONE] is dropped (host appends its own tail), so only the JSON frame.
+	if len(emitted) != 1 {
+		t.Fatalf("expected 1 frame, got %d: %v", len(emitted), emitted)
 	}
 	if string(emitted[0]) != "data: {\"x\":1}\n\n" {
 		t.Fatalf("unexpected frame 0: %q", string(emitted[0]))
-	}
-	if string(emitted[1]) != "data: [DONE]\n\n" {
-		t.Fatalf("unexpected frame 1: %q", string(emitted[1]))
 	}
 }
