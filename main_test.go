@@ -366,6 +366,44 @@ func TestAuthParseFromFilePayload(t *testing.T) {
 	if !resp2.Handled || resp2.Auth.Provider != "zen" {
 		t.Fatalf("unexpected auth response 2: %+v", resp2)
 	}
+
+	// Scenario 3: CPA v8 host sends the auth file payload as RawJSON
+	payload3, _ := json.Marshal(map[string]any{
+		"Provider": "zen",
+		"RawJSON":  json.RawMessage(`{"type":"zen","provider":"zen","api_key":"sk-opencode-secret-789","base_url":"https://opencode.ai/zen/v1"}`),
+		"FileName": "zen-key.json",
+	})
+	out3, err := handleMethod("auth.parse", payload3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var env3 envelope
+	json.Unmarshal(out3, &env3)
+	var resp3 authParseResponse
+	json.Unmarshal(env3.Result, &resp3)
+	if !resp3.Handled || resp3.Auth.Provider != "zen" {
+		t.Fatalf("unexpected auth response 3: %+v", resp3)
+	}
+	if len(resp3.Auth.StorageJSON) == 0 || !strings.Contains(string(resp3.Auth.StorageJSON), "sk-opencode-secret-789") {
+		t.Fatalf("auth storage json should carry the raw key: %s", resp3.Auth.StorageJSON)
+	}
+}
+
+// TestAuthParseRawJSONVirtualKeys verifies that virtual auths from plugin
+// config api-keys are still returned when the host sends no file payload.
+func TestAuthParseRawJSONVirtualKeys(t *testing.T) {
+	resetConfig(t, pluginConfig{Enabled: true, Provider: "zen", APIKeys: []string{"sk-opencode-raw-1", "sk-opencode-raw-2"}})
+	out, err := handleMethod("auth.parse", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var env envelope
+	json.Unmarshal(out, &env)
+	var resp authParseResponse
+	json.Unmarshal(env.Result, &resp)
+	if !resp.Handled || len(resp.Auths) != 2 {
+		t.Fatalf("auths = %d, want 2: %s", len(resp.Auths), out)
+	}
 }
 
 // =========================================================================

@@ -89,7 +89,7 @@ const (
 	defaultUserAgent = "opencode/1.18.31 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14"
 )
 
-var pluginVersion = "0.7.1"
+var pluginVersion = "0.7.2"
 
 var (
 	canonicalSessionRe = regexp.MustCompile(`^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$`)
@@ -219,7 +219,36 @@ func configure(raw []byte) error {
 		}
 	}
 	storeConfig(cfg)
+	persistVirtualAuths(cfg)
 	return nil
+}
+
+// persistVirtualAuths materializes plugin-config api-keys as real credential
+// files in the host auth directory via the host.auth.save callback. CPA v8
+// only creates runtime auths from files discovered in the auth dir (the
+// auth.parse payload carries RawJSON, not StorageJSON), so virtual keys
+// configured through the management center must be written to disk to
+// become selectable credentials.
+func persistVirtualAuths(cfg pluginConfig) {
+	if !cfg.Enabled || len(cfg.APIKeys) == 0 {
+		return
+	}
+	for _, key := range cfg.APIKeys {
+		id := sha256Prefix(key)
+		name := fmt.Sprintf("%s-%s.json", cfg.Provider, id)
+		payload, _ := json.Marshal(map[string]string{
+			"type":     cfg.Provider,
+			"provider": cfg.Provider,
+			"api_key":  key,
+			"base_url": cfg.BaseURL,
+		})
+		// Best effort: failures are logged by the host; the auth.parse
+		// fallback still returns virtual auths for hosts that support it.
+		_, _ = callHost("host.auth.save", map[string]any{
+			"Name": name,
+			"JSON": json.RawMessage(payload),
+		})
+	}
 }
 
 func trimNonEmpty(in []string) []string {
@@ -677,18 +706,30 @@ func handleMethod(method string, payload []byte) ([]byte, error) {
 //  1. Files where provider is "zen" or type is "zen"
 //  2. Any file containing an "api_key" or "key" field with "sk-" prefix
 //  3. Files matching configured keys in plugins.configs.zen
+//
+// The host sends the auth file payload as RawJSON (AuthParseRequest.RawJSON
+// in CPA v8); StorageJSON is accepted as well for compatibility with hosts
+// that deliver it under that name.
 func authParse(payload []byte) ([]byte, error) {
 	cfg := loadedConfig()
 	if len(payload) > 0 {
 		var req struct {
 			Provider    string          `json:"Provider"`
 			StorageJSON json.RawMessage `json:"StorageJSON"`
+			RawJSON     json.RawMessage `json:"RawJSON"`
 			FileName    string          `json:"FileName"`
 			ID          string          `json:"ID"`
 		}
-		if err := json.Unmarshal(payload, &req); err == nil && len(req.StorageJSON) > 0 {
+		if err := json.Unmarshal(payload, &req); err == nil {
+			raw := req.StorageJSON
+			if len(raw) == 0 {
+				raw = req.RawJSON
+			}
 			var stored map[string]any
-			if err := json.Unmarshal(req.StorageJSON, &stored); err == nil {
+			if len(raw) > 0 {
+				_ = json.Unmarshal(raw, &stored)
+			}
+			if len(stored) > 0 {
 				key := extractAPIKey(stored)
 				pName := extractProvider(stored, req.Provider)
 
@@ -730,7 +771,7 @@ func authParse(payload []byte) ([]byte, error) {
 							ID:          authID,
 							FileName:    fileName,
 							Label:       authLabel(cfg.Provider, id),
-							StorageJSON: req.StorageJSON,
+							StorageJSON: raw,
 							Models:      modelsList,
 							Metadata:    map[string]any{"type": cfg.Provider},
 						},
