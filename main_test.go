@@ -1527,3 +1527,54 @@ func TestModelRegistrationMergesDiscoveredModels(t *testing.T) {
 		t.Fatalf("model count = %d, want %d (defaults + 1 new)", len(resp.Result.Models), len(defaultZenModels)+1)
 	}
 }
+
+func TestModelRegistrationExcludesConfiguredModels(t *testing.T) {
+	discoveredModels.mu.Lock()
+	discoveredModels.ids = []string{"mimo-v2.6-flash-free", "jev-1.13-free", "space-bunny-free"}
+	discoveredModels.fetchedAt = time.Now()
+	discoveredModels.mu.Unlock()
+	defer func() {
+		discoveredModels.mu.Lock()
+		discoveredModels.ids, discoveredModels.fetchedAt = nil, time.Time{}
+		discoveredModels.mu.Unlock()
+	}()
+	resetConfig(t, pluginConfig{Enabled: true, Provider: "zen", ExcludeModels: []string{"jev-1.13-free", "SPACE-BUNNY-FREE"}})
+
+	out, err := modelRegistration()
+	if err != nil {
+		t.Fatalf("modelRegistration: %v", err)
+	}
+	var resp struct {
+		Result struct {
+			Models []struct{ ID string `json:"id"` } `json:"models"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(out, &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	for _, m := range resp.Result.Models {
+		if m.ID == "jev-1.13-free" || m.ID == "space-bunny-free" {
+			t.Fatalf("excluded model announced: %s", m.ID)
+		}
+	}
+}
+
+func TestConfigureParsesExcludeModelsCommaString(t *testing.T) {
+	payload, err := json.Marshal(struct {
+		ConfigYAML []byte `json:"config_yaml"`
+	}{[]byte("exclude-models: \"jev-1.13-free, space-bunny-free\"\napi-keys: k1,k2\n")})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if err := configure(payload); err != nil {
+		t.Fatalf("configure: %v", err)
+	}
+	t.Cleanup(func() { storeConfig(defaultPluginConfig()) })
+	cfg := loadedConfig()
+	if len(cfg.ExcludeModels) != 2 || cfg.ExcludeModels[0] != "jev-1.13-free" || cfg.ExcludeModels[1] != "space-bunny-free" {
+		t.Fatalf("ExcludeModels = %v", cfg.ExcludeModels)
+	}
+	if len(cfg.APIKeys) != 2 || cfg.APIKeys[0] != "k1" || cfg.APIKeys[1] != "k2" {
+		t.Fatalf("APIKeys = %v", cfg.APIKeys)
+	}
+}

@@ -89,7 +89,7 @@ const (
 	defaultUserAgent = "opencode/1.18.31 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14"
 )
 
-var pluginVersion = "0.7.0"
+var pluginVersion = "0.7.1"
 
 var (
 	canonicalSessionRe = regexp.MustCompile(`^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$`)
@@ -136,13 +136,14 @@ func (m modelRoute) EndpointPath() string {
 }
 
 type pluginConfig struct {
-	Enabled  bool
-	Provider string
-	BaseURL  string
-	APIKeys  []string
-	Client   string
-	Project  string
-	Models   []modelRoute
+	Enabled       bool
+	Provider      string
+	BaseURL       string
+	APIKeys       []string
+	ExcludeModels []string
+	Client        string
+	Project       string
+	Models        []modelRoute
 }
 
 func defaultPluginConfig() pluginConfig {
@@ -204,6 +205,7 @@ func configure(raw []byte) error {
 		cfg.Project = "global"
 	}
 	cfg.APIKeys = trimNonEmpty(cfg.APIKeys)
+	cfg.ExcludeModels = trimNonEmpty(cfg.ExcludeModels)
 	for i := range cfg.Models {
 		m := &cfg.Models[i]
 		m.Model = strings.TrimSpace(m.Model)
@@ -259,6 +261,18 @@ func applyConfigNode(cfg *pluginConfig, node map[string]any) {
 	case string:
 		for _, part := range strings.Split(t, ",") {
 			cfg.APIKeys = append(cfg.APIKeys, part)
+		}
+	}
+	switch t := node["exclude-models"].(type) {
+	case []any:
+		for _, item := range t {
+			if s, ok := item.(string); ok {
+				cfg.ExcludeModels = append(cfg.ExcludeModels, s)
+			}
+		}
+	case string:
+		for _, part := range strings.Split(t, ",") {
+			cfg.ExcludeModels = append(cfg.ExcludeModels, part)
 		}
 	}
 	if rawModels, ok := node["models"].([]any); ok {
@@ -624,6 +638,8 @@ func handleMethod(method string, payload []byte) ([]byte, error) {
 				Logo:             "https://raw.githubusercontent.com/Victor9578/cpa-plugin-opencodezen/main/logo.svg",
 				ConfigFields: []any{
 					map[string]any{"Name": "enabled", "Type": "boolean", "Description": "Enable the zen provider plugin."},
+					map[string]any{"Name": "api-keys", "Type": "string", "Description": "OpenCode zen API keys (comma-separated). Each key becomes a virtual zen credential; alternatively drop key files into the auth directory."},
+					map[string]any{"Name": "exclude-models", "Type": "string", "Description": "Model IDs (comma-separated) to exclude from the models auto-discovered from the zen /models endpoint."},
 				},
 			},
 			Capabilities: capabilities{
@@ -993,6 +1009,17 @@ func discoveredZenModels(cfg pluginConfig) []string {
 	return discoveredModels.ids
 }
 
+// modelExcluded reports whether a discovered model ID is filtered out by
+// the exclude-models plugin configuration (case-insensitive).
+func modelExcluded(cfg pluginConfig, model string) bool {
+	for _, ex := range cfg.ExcludeModels {
+		if strings.EqualFold(strings.TrimSpace(ex), model) {
+			return true
+		}
+	}
+	return false
+}
+
 // modelRegistration announces supported Zen models to CPA.
 // If the user configured custom models in plugins.configs.zen, it announces those;
 // otherwise it announces the default set of Zen free-tier models plus any
@@ -1003,6 +1030,9 @@ func modelRegistration() ([]byte, error) {
 	if len(declared) == 0 {
 		declared = defaultZenModels
 		for _, id := range discoveredZenModels(cfg) {
+			if modelExcluded(cfg, id) {
+				continue
+			}
 			dup := false
 			for _, m := range declared {
 				if strings.EqualFold(m.Model, id) {

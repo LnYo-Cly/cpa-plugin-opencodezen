@@ -66,7 +66,13 @@ plugins:
   configs:
     zen:
       enabled: true
+      # 可选：直接在插件配置里添加 OpenCode key（逗号分隔，每个 key 自动成为一条虚拟凭证）
+      # api-keys: "oc_sk_xxx,oc_sk_yyy"
+      # 可选：从 /models 自动发现的模型中排除指定模型（逗号分隔，大小写不敏感）
+      # exclude-models: "jev-1.13-free,space-bunny-free"
 ```
+
+> `api-keys` 和 `exclude-models` 也可以在 CPA Web 管理中心的插件配置页直接填写。
 
 ### 2. 添加凭证（认证目录）
 
@@ -83,7 +89,9 @@ plugins:
 
 > **说明**：
 > - 插件默认已注册以下免费模型：`mimo-v2.6-flash-free`、`mimo-v2.5-free`、`ling-3.0-flash-fin-free`、`nemotron-3-ultra-free`、`muse-spark-1.3-contributor-free`。
-> - 如果官方上线了新模型，可以在该 JSON 文件中添加 `"models": [{"name": "新模型名"}]` 即可动态生效，无需重新编译插件。
+> - 插件会自动从 zen `/models` 接口发现新的免费模型（`*-free` 后缀，10 分钟缓存）并注册，无需重新编译；不想用的模型可用 `exclude-models` 排除。
+> - 也可以在凭证 JSON 文件中添加 `"models": [{"name": "新模型名"}]` 手动指定。
+> - 端点（chat / responses）自动识别：注册时按模型名推断，请求 400 时自动换端点重试并记住。
 
 ### 3. 模型能力元数据（上下文窗口等）
 
