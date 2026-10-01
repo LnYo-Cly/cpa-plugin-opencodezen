@@ -105,7 +105,23 @@ plugins:
 
 ### 3. 模型能力元数据（上下文窗口等）
 
-插件会向 CPA 宣告模型能力元数据（上下文窗口、输出上限、输入模态、推理档位），下游客户端（pi、Codex 等）通过 `/v1/models` 读取 `context_window` / `max_tokens` 等字段。内置默认值：mimo 系列为 1M 上下文。
+插件会向 CPA 宣告模型能力元数据（上下文窗口、输出上限、输入模态、推理档位、显示名），下游客户端（pi、Codex 等）通过 `/v1/models` 读取 `context_window` / `max_tokens` 等字段。
+
+内置规格表与 OpenCode 官方客户端自己的模型目录（models.dev 的 `opencode` provider）对齐，快照 2026-10-01：
+
+| 模型 | 上下文 | 最大输出 | 推理档位 | 模态 |
+|---|---|---|---|---|
+| mimo-v2.6-flash-free / mimo-v2.5-free | 200K | 32K | 开关式 | 文本+图像 |
+| ling-3.0-flash-fin-free | 256K | 32K | 开关式 | 文本 |
+| nemotron-3-ultra-free | 1M | 128K | 开关式 | 文本 |
+| nemotron-3.5-lightning-free | 256K | 256K | 开关式 | 文本 |
+| muse-spark-1.3/1.2-contributor-free | 1M | 128K | minimal…xhigh | 文本+图像 |
+| longcat-2.5-preview-free | 1M | 128K | 开关式 | 文本+图像 |
+| space-bunny-free | 1M | 512K | low…max | 文本+图像 |
+| big-pickle | 200K | 32K | 开关式 | 文本 |
+| deepseek-v4-flash-free | 200K | 128K | low/high/max | 文本 |
+
+> 注：不宣告能力时，CPA 的 codex 模型目录会用 gpt-5.5 模板兜底（272K/16K）——之前 muse 显示 272K 就是这个原因。
 
 如需覆盖或为其他模型声明能力，在 `config.yaml` 的 `plugins.configs.zen.models` 中配置：
 
@@ -173,6 +189,7 @@ curl -s -N http://localhost:8080/backend-api/codex/responses \
 | 现象 | 原因与解决 |
 |---|---|
 | agent 客户端（pi 等）模型反复执行同一条命令、读不存在的文件 | 插件 ≤0.7.3 在 Responses→chat 转换时丢弃了 `function_call` / `function_call_output` 历史项，模型每轮看不到自己之前的工具调用与结果。升级到 **0.7.4+**。 |
+| muse 等模型第二轮起必报 400，随后整轮 `auth_unavailable: no auth available` 中断 | 插件 ≤0.7.5 之前的 responses→responses 直通路径没有剥离重放的 `reasoning` 项（`rs_...` id 引用上游不保存的会话状态，报 `Referenced reasoning item was not found or has expired`），连续 400 还会让 CPA 把凭证标记不可用。升级到 **0.7.5+**（自动剥离 `reasoning` 项与 `previous_response_id`）。 |
 | 选择 claude / gemini / jev 等模型后报 `dialect this plugin cannot speak` | 这些模型上游是 Anthropic Messages（`claude-*`、`qwen3.7-*` 等）、`/systemone`（`jev-*`）或 AI-SDK（`gemini-*`）端点，本插件只讲 chat-completions 与 /responses 两种方言；0.7.5 起这类模型直接不注册。确需强行指定时可在 `plugins.configs.zen models` 里显式写 `endpoint`（逃生口，通常无济于事）。 |
 | 上游 `400 unknown_parameter` / `strict` 校验失败 | 插件 ≤0.7.4 的方言转换不彻底，`stream_options`、`store`、`max_tokens`↔`max_output_tokens`、`tool_choice` 形状等单侧参数会原样泄漏到另一方言，严格校验的 openai 兼容上游直接拒绝。升级到 **0.7.5+**。 |
 | 上游因 max tokens 截断后，流式整轮报错、或非流式把截断当正常完成 | 插件 ≤0.7.4 把 `response.incomplete` 当失败抛错（流式），或折叠时丢掉 incomplete 状态导致 `finish_reason` 为 `stop`（非流式）。升级到 **0.7.5+**：按原因映射为 `finish_reason: length`/`content_filter` 并保留已生成内容与 usage。 |
@@ -187,10 +204,14 @@ curl -s -N http://localhost:8080/backend-api/codex/responses \
 
 ## 版本历史
 
-- **0.7.5**：端点路由对齐官方文档 + 跨方言转发加固：
+- **0.7.5**：端点路由对齐官方文档 + 跨方言转发加固 + 官方客户端行为对齐：
+  - **修复 muse 第二轮起必 400 → auth_unavailable 中断**：responses→responses 直通路径现在剥离重放的 `reasoning` 项（`rs_` id 引用上游不保留的状态）与 `previous_response_id`；此前 pi 等 codex 方言客户端每轮重放 reasoning 项都会 400，连续失败后 CPA 把凭证标记不可用。
   - 端点：内置官方 Zen 端点表快照（按模型家族分类，抗文档变动；`/models` 无端点字段，文档是唯一机器可用来源）。注册与路由优先查表；非 OpenAI 方言模型（claude/gemini/jev/qwen3.7 等）不再被宣告；未显式配置端点时 400/404/405 **双向**换方言重试（此前仅 chat→responses 单向）并记住结果；显式 `endpoint` 配置永远优先。
+  - 模型识别：内置规格表与 OpenCode 官方客户端自己的模型目录（models.dev `opencode` provider）对齐——上下文/最大输出/推理档位/模态/显示名。修正 mimo（1M→200K）、补齐 muse（1M/128K，修复客户端显示 272K 的问题）等全部免费模型。
+  - 转发封装（对齐官方客户端）：补齐官方 6 大核心工具（bash/edit/glob/grep/read/write，官方 schema）并按字母序排序，无工具请求（压缩/总结）注入全套并设 `tool_choice: none`；`reasoning_effort` 按模型档位规约（muse: max→xhigh；开关式模型如 mimo 直接删除；未知模型钳到 low/medium/high），彻底消除 400 `Invalid request parameters`；删除非法顶层 `thinking` 对象；输出 token 按模型上限钳位。
   - 请求卫生：双向方言转换补齐参数映射与单侧字段清理 —— `max_output_tokens`↔`max_tokens`、`tool_choice` 函数对象互转、`response_format` json_schema 摊平、删除 `stream_options`/`logit_bias`/`store`/`include`/`truncation` 等单侧字段、`developer`→`system`、`input_image`→`image_url`、legacy `functions`/`function_call` 迁移、工具定义 `strict:null` 双向清理、assistant 文本与 `tool_calls` 并存时不再丢失。
   - 响应卫生：`response.incomplete` 不再当失败（流式）、不再被折叠成正常完成（非流式），按原因映射 `finish_reason: length|content_filter` 并保留已生成内容与 usage；chat 折叠保留上游真实 tool_call id（此前伪造 `call_%d`），上游不发 role 时补 `assistant`（此前空 role 会被宿主翻译层丢弃，表现为“空回复”）；`custom_tool_call` 事件全链路支持。
+  - 自愈：上游 401/403（积分/鉴权/风控）时轮换 API key + 铸造全新官方格式会话 ID 重试一次；请求头补齐官方 `x-session-affinity` / `X-Session-Id`。
 - **0.7.4**：修复 agent 客户端（pi / Codex 等 Responses 协议）多轮工具调用历史丢失的严重问题：
   - 请求方向：`function_call` / `function_call_output` 历史项在转换为 chat 格式时被静默丢弃，导致上游模型每轮“失忆”、重复执行相同工具调用（agent 死循环）。
   - 反向（chat 客户端 → responses 模型）：assistant 的 `tool_calls` 与 `role:"tool"` 结果消息同样丢失，现已转换为规范的 `function_call` / `function_call_output` 项。

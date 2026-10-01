@@ -164,8 +164,34 @@ func TestModelRegistrationIncludesCapabilities(t *testing.T) {
 	if mimo == nil {
 		t.Fatal("mimo model missing from registration")
 	}
-	if mimo.ContextLength != 1000000 {
-		t.Fatalf("mimo ContextLength = %d, want 1000000", mimo.ContextLength)
+	// Aligned with the OpenCode client's own catalog (models.dev, "opencode"
+	// provider): mimo free tier is 200K context, not 1M.
+	if mimo.ContextLength != 200000 {
+		t.Fatalf("mimo ContextLength = %d, want 200000", mimo.ContextLength)
+	}
+	if mimo.MaxCompletionTokens != 32000 {
+		t.Fatalf("mimo MaxCompletionTokens = %d, want 32000", mimo.MaxCompletionTokens)
+	}
+	var muse *modelInfo
+	for i := range resp.Models {
+		if resp.Models[i].ID == "muse-spark-1.3-contributor-free" {
+			muse = &resp.Models[i]
+		}
+	}
+	if muse == nil {
+		t.Fatal("muse model missing from registration")
+	}
+	// muse is 1M context / 128K output; without the declaration CPA's codex
+	// catalog falls back to the gpt-5.5 template (272000) and clients show
+	// a wrong context window.
+	if muse.ContextLength != 1048576 {
+		t.Fatalf("muse ContextLength = %d, want 1048576", muse.ContextLength)
+	}
+	if muse.MaxCompletionTokens != 131072 {
+		t.Fatalf("muse MaxCompletionTokens = %d, want 131072", muse.MaxCompletionTokens)
+	}
+	if muse.Thinking == nil || len(muse.Thinking.Levels) == 0 {
+		t.Fatal("muse must announce its reasoning effort levels")
 	}
 }
 
@@ -673,14 +699,22 @@ func TestEnsureGateToolsIdempotent(t *testing.T) {
 	json.Unmarshal(root, &body)
 	ensureGateTools(body, "chat")
 	tools := body["tools"].([]any)
-	if len(tools) != 2 {
-		t.Fatalf("tools count = %d, want 2 (bash existing + read appended)", len(tools))
+	if len(tools) != len(officialGateTools) {
+		t.Fatalf("tools count = %d, want %d (existing bash + missing official tools)", len(tools), len(officialGateTools))
 	}
 	// Second call does not duplicate.
 	ensureGateTools(body, "chat")
 	tools = body["tools"].([]any)
-	if len(tools) != 2 {
-		t.Fatalf("tools count = %d after second call, want 2", len(tools))
+	if len(tools) != len(officialGateTools) {
+		t.Fatalf("tools count = %d after second call, want %d", len(tools), len(officialGateTools))
+	}
+	// Tools are sorted by function name, official-client style.
+	for i := 1; i < len(tools); i++ {
+		prev, _ := tools[i-1].(map[string]any)
+		cur, _ := tools[i].(map[string]any)
+		if toolEntryName(prev, "chat") > toolEntryName(cur, "chat") {
+			t.Fatal("tools are not sorted by function name")
+		}
 	}
 }
 
@@ -772,8 +806,8 @@ func TestPrepareUpstreamBodyConvertsResponsesToChat(t *testing.T) {
 		t.Fatalf("converted content = %v", second["content"])
 	}
 	tools, _ := root["tools"].([]any)
-	if len(tools) != 2 {
-		t.Fatalf("tools = %v, want existing bash plus appended read", tools)
+	if len(tools) != len(officialGateTools) {
+		t.Fatalf("tools = %v, want the full official tool set", tools)
 	}
 	bash, _ := tools[0].(map[string]any)
 	fn, _ := bash["function"].(map[string]any)
@@ -821,8 +855,8 @@ func TestPrepareUpstreamBodyConvertsChatToResponses(t *testing.T) {
 		t.Fatalf("converted content = %v", message["content"])
 	}
 	tools, _ := root["tools"].([]any)
-	if len(tools) != 2 {
-		t.Fatalf("tools = %v, want existing bash plus appended read", tools)
+	if len(tools) != len(officialGateTools) {
+		t.Fatalf("tools = %v, want the full official tool set", tools)
 	}
 	bash, _ := tools[0].(map[string]any)
 	if bash["name"] != "bash" {

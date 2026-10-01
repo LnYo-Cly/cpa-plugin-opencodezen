@@ -7,8 +7,10 @@ package main
 
 import (
 	"encoding/json"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 // =========================================================================
@@ -540,5 +542,245 @@ func TestFoldResponsesSSEIncompletePrefersNestedResponse(t *testing.T) {
 	}
 	if completion.Choices[0].FinishReason != "length" {
 		t.Errorf("finish_reason = %q, want length", completion.Choices[0].FinishReason)
+	}
+}
+
+// =========================================================================
+// replayed reasoning items (the 2026-10-01 interruption root cause)
+// =========================================================================
+
+// TestPrepareUpstreamBodyDropsReplayedReasoningItems guards the bug that
+// interrupted every muse follow-up turn: pi (codex responses dialect)
+// replays reasoning items whose rs_ ids reference server state the zen
+// gateway does not retain, and the responses→responses passthrough path
+// never stripped them. The 400s then cascaded into auth_unavailable.
+func TestPrepareUpstreamBodyDropsReplayedReasoningItems(t *testing.T) {
+	resetConfig(t, testConfig())
+	payload := []byte(`{
+	  "model": "muse-spark-1.3-contributor-free",
+	  "stream": true,
+	  "previous_response_id": "resp_old",
+	  "input": [
+	    {"type": "reasoning", "id": "rs_resp_6abdbe95e6cc8c41773e47d1_0", "summary": [{"type": "summary_text", "text": "thinking"}]},
+	    {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+	    {"type": "function_call", "call_id": "call_1", "name": "bash", "arguments": "{\"command\":\"ls\"}"},
+	    {"type": "function_call_output", "call_id": "call_1", "output": "done"}
+	  ]
+	}`)
+	body, err := prepareUpstreamBody(executorRequest{Payload: payload}, modelRoute{Model: "muse-spark-1.3-contributor-free", Endpoint: "responses"})
+	if err != nil {
+		t.Fatalf("prepareUpstreamBody: %v", err)
+	}
+	var root map[string]any
+	if err := json.Unmarshal(body, &root); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := root["previous_response_id"]; ok {
+		t.Fatal("previous_response_id survived: zen keeps no server response state")
+	}
+	input, _ := root["input"].([]any)
+	if len(input) != 3 {
+		t.Fatalf("input items = %s, want 3 (reasoning dropped, rest preserved)", mustJSON(input))
+	}
+	for _, item := range input {
+		entry, _ := item.(map[string]any)
+		if itemType, _ := entry["type"].(string); strings.EqualFold(itemType, "reasoning") {
+			t.Fatalf("replayed reasoning item survived: %s", mustJSON(entry))
+		}
+	}
+	// The tool history must survive untouched.
+	first, _ := input[1].(map[string]any)
+	if first["type"] != "function_call" || first["call_id"] != "call_1" {
+		t.Fatalf("function_call item lost: %s", mustJSON(input))
+	}
+}
+
+// =========================================================================
+// reasoning effort normalization
+// =========================================================================
+
+func TestNormalizeReasoningEffort(t *testing.T) {
+	// Effort-type model (muse: minimal..xhigh): max maps to xhigh.
+	root := map[string]any{"reasoning_effort": "max"}
+	normalizeReasoningEffort(root, "chat", "muse-spark-1.3-contributor-free")
+	if root["reasoning_effort"] != "xhigh" {
+		t.Fatalf("muse max → %v, want xhigh", root["reasoning_effort"])
+	}
+
+	// Responses dialect: effort consolidates into reasoning.effort.
+	root = map[string]any{"reasoning": map[string]any{"effort": "max"}}
+	normalizeReasoningEffort(root, "responses", "muse-spark-1.3-contributor-free")
+	reasoning, _ := root["reasoning"].(map[string]any)
+	if reasoning["effort"] != "xhigh" {
+		t.Fatalf("responses muse effort = %v, want xhigh", reasoning["effort"])
+	}
+
+	// Toggle-only model (mimo): the parameter is rejected, drop it.
+	root = map[string]any{"reasoning_effort": "high"}
+	normalizeReasoningEffort(root, "chat", "mimo-v2.6-flash-free")
+	if _, ok := root["reasoning_effort"]; ok {
+		t.Fatalf("mimo is toggle-only, effort must be dropped: %v", root)
+	}
+
+	// deepseek-v4-flash-free supports low/high/max: medium maps to high.
+	root = map[string]any{"reasoning_effort": "medium"}
+	normalizeReasoningEffort(root, "chat", "deepseek-v4-flash-free")
+	if root["reasoning_effort"] != "high" {
+		t.Fatalf("deepseek medium → %v, want high", root["reasoning_effort"])
+	}
+
+	// Unknown model: clamp to the safe set.
+	root = map[string]any{"reasoning_effort": "max"}
+	normalizeReasoningEffort(root, "chat", "some-new-model")
+	if root["reasoning_effort"] != "high" {
+		t.Fatalf("unknown max → %v, want high", root["reasoning_effort"])
+	}
+
+	// off/none means no thinking.
+	root = map[string]any{"reasoning_effort": "off"}
+	normalizeReasoningEffort(root, "chat", "muse-spark-1.3-contributor-free")
+	if _, ok := root["reasoning_effort"]; ok {
+		t.Fatalf("effort off must be dropped: %v", root)
+	}
+
+	// The anthropic-style thinking object never survives.
+	root = map[string]any{"thinking": map[string]any{"type": "enabled", "budget_tokens": 8192}}
+	normalizeReasoningEffort(root, "chat", "muse-spark-1.3-contributor-free")
+	if _, ok := root["thinking"]; ok {
+		t.Fatalf("thinking object survived: %v", root)
+	}
+
+	// A reasoning object without effort (e.g. summary request) survives on
+	// the responses dialect, minus any effort key.
+	root = map[string]any{"reasoning": map[string]any{"summary": "auto"}}
+	normalizeReasoningEffort(root, "responses", "muse-spark-1.3-contributor-free")
+	reasoning, _ = root["reasoning"].(map[string]any)
+	if reasoning["summary"] != "auto" {
+		t.Fatalf("reasoning.summary lost: %v", root)
+	}
+	if _, ok := reasoning["effort"]; ok {
+		t.Fatalf("effort must not be invented: %v", reasoning)
+	}
+
+	// Chat dialect drops a leftover reasoning object entirely.
+	root = map[string]any{"reasoning": map[string]any{"effort": "high"}}
+	normalizeReasoningEffort(root, "chat", "muse-spark-1.3-contributor-free")
+	if _, ok := root["reasoning"]; ok {
+		t.Fatalf("chat dialect must not carry a reasoning object: %v", root)
+	}
+	if root["reasoning_effort"] != "high" {
+		t.Fatalf("chat effort = %v, want high", root["reasoning_effort"])
+	}
+}
+
+// =========================================================================
+// output token clamping
+// =========================================================================
+
+func TestClampMaxOutput(t *testing.T) {
+	root := map[string]any{"max_tokens": 999999.0}
+	clampMaxOutput(root, "muse-spark-1.3-contributor-free")
+	if root["max_tokens"] != float64(131072) {
+		t.Fatalf("muse max_tokens = %v, want 131072", root["max_tokens"])
+	}
+
+	root = map[string]any{"max_output_tokens": 999999.0}
+	clampMaxOutput(root, "some-unknown-model")
+	if root["max_output_tokens"] != float64(65536) {
+		t.Fatalf("unknown model cap = %v, want 65536", root["max_output_tokens"])
+	}
+
+	root = map[string]any{"max_tokens": 1000.0}
+	clampMaxOutput(root, "muse-spark-1.3-contributor-free")
+	if root["max_tokens"] != float64(1000) {
+		t.Fatalf("in-range max_tokens must be untouched: %v", root["max_tokens"])
+	}
+}
+
+// =========================================================================
+// toolless requests
+// =========================================================================
+
+func TestEnsureGateToolsToollessRequest(t *testing.T) {
+	root := map[string]any{"messages": []any{map[string]any{"role": "user", "content": "summarize this"}}}
+	ensureGateTools(root, "chat")
+	tools, _ := root["tools"].([]any)
+	if len(tools) != len(officialGateTools) {
+		t.Fatalf("tools = %d, want the full official set", len(tools))
+	}
+	if root["tool_choice"] != "none" {
+		t.Fatalf("tool_choice = %v, want none (client sent no tools)", root["tool_choice"])
+	}
+
+	// An explicit tool_choice is never overwritten.
+	root = map[string]any{
+		"messages":    []any{map[string]any{"role": "user", "content": "hi"}},
+		"tool_choice": "auto",
+	}
+	ensureGateTools(root, "chat")
+	if root["tool_choice"] != "auto" {
+		t.Fatalf("explicit tool_choice overwritten: %v", root["tool_choice"])
+	}
+
+	// Requests that already carry tools keep their own tool_choice absent.
+	root = map[string]any{
+		"messages": []any{map[string]any{"role": "user", "content": "hi"}},
+		"tools": []any{map[string]any{
+			"type":     "function",
+			"function": map[string]any{"name": "bash", "parameters": map[string]any{"type": "object"}},
+		}},
+	}
+	ensureGateTools(root, "chat")
+	if _, exists := root["tool_choice"]; exists {
+		t.Fatalf("tool_choice must not be injected when the client sent tools: %v", root["tool_choice"])
+	}
+}
+
+// =========================================================================
+// official session id minting
+// =========================================================================
+
+func TestNewOfficialSessionID(t *testing.T) {
+	id := newOfficialSessionID()
+	if !canonicalSessionRe.MatchString(id) {
+		t.Fatalf("id %q does not match the official shape", id)
+	}
+	// The descending timestamp must decode to roughly now. The official
+	// format keeps a 36-bit millisecond timestamp (wraps every ~2.18 years),
+	// so decoding resolves the wraparound against the current time.
+	inverted, err := strconv.ParseUint(id[4:16], 16, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	combined := ^inverted & 0xFFFFFFFFFFFF
+	ts36 := int64(combined >> 12)
+	const mod36 = int64(1) << 36
+	now := time.Now().UnixMilli()
+	candidate := now - now%mod36 + ts36
+	if candidate > now+mod36/2 {
+		candidate -= mod36
+	} else if candidate < now-mod36/2 {
+		candidate += mod36
+	}
+	if delta := now - candidate; delta < -time.Minute.Milliseconds() || delta > time.Minute.Milliseconds() {
+		t.Fatalf("session id timestamp decodes to %dms from now", delta)
+	}
+	// Two ids differ (random suffix).
+	if newOfficialSessionID() == id {
+		t.Fatal("session ids must be unique")
+	}
+}
+
+func TestRefreshGateSession(t *testing.T) {
+	headers := map[string][]string{
+		targetSessionHeader: {"ses_old"},
+	}
+	refreshGateSession(headers)
+	session := headers[targetSessionHeader][0]
+	if !canonicalSessionRe.MatchString(session) || session == "ses_old" {
+		t.Fatalf("refreshGateSession left %q", session)
+	}
+	if headers["X-Session-Affinity"][0] != session || headers["X-Session-Id"][0] != session {
+		t.Fatalf("affinity headers not aligned: %v", headers)
 	}
 }

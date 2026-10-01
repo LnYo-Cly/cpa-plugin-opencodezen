@@ -55,6 +55,7 @@ import "C"
 
 import (
 	"bytes"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -62,6 +63,7 @@ import (
 	"io"
 	"net/http"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -660,6 +662,8 @@ type modelCapabilities struct {
 	ContextLength       int64
 	MaxCompletionTokens int64
 	InputModalities     []string
+	ReasoningLevels     []string
+	DisplayName         string
 	Thinking            *thinkingSupport
 }
 
@@ -1014,19 +1018,45 @@ var defaultZenModels = []modelRoute{
 	{Model: "muse-spark-1.3-contributor-free", Alias: "muse-spark-1.3-contributor-free", Endpoint: "responses"},
 }
 
-// defaultModelCapabilities announces built-in capability metadata for known
-// Zen free-tier models. Values can be overridden per model through
-// plugins.configs.zen models entries (context-length, max-completion-tokens,
-// input-modalities, reasoning-levels).
+// defaultModelCapabilities announces built-in capability metadata for the
+// Zen free-tier models. Values are aligned with the OpenCode client's own
+// model catalog (models.dev, "opencode" provider — the catalog OpenCode
+// itself consumes), snapshotted 2026-10-01:
+//   - context window and max output tokens from limit.context / limit.output;
+//   - reasoning effort levels from reasoning_options (effort-type models);
+//     models with toggle-only thinking carry no levels;
+//   - input modalities capped at text+image (audio/video parts are not
+//     translated by this plugin);
+//   - display names from the catalog.
+//
+// Values can be overridden per model through plugins.configs.zen models
+// entries (context-length, max-completion-tokens, input-modalities,
+// reasoning-levels).
 var defaultModelCapabilities = map[string]modelCapabilities{
-	"mimo-v2.6-flash-free": {ContextLength: 1000000},
-	"mimo-v2.5-free":       {ContextLength: 1000000},
+	"mimo-v2.6-flash-free":            {ContextLength: 200000, MaxCompletionTokens: 32000, InputModalities: []string{"text", "image"}, DisplayName: "MiMo-V2.6-Flash Free"},
+	"mimo-v2.5-free":                  {ContextLength: 200000, MaxCompletionTokens: 32000, InputModalities: []string{"text", "image"}, DisplayName: "MiMo V2.5 Free"},
+	"ling-3.0-flash-fin-free":         {ContextLength: 262144, MaxCompletionTokens: 32768, DisplayName: "Ling 3.0 Flash Fin Free"},
+	"nemotron-3-ultra-free":           {ContextLength: 1000000, MaxCompletionTokens: 128000, DisplayName: "Nemotron 3 Ultra Free"},
+	"nemotron-3.5-lightning-free":     {ContextLength: 262144, MaxCompletionTokens: 262144, DisplayName: "Nemotron 3.5 Lightning Free"},
+	"muse-spark-1.3-contributor-free": {ContextLength: 1048576, MaxCompletionTokens: 131072, InputModalities: []string{"text", "image"}, ReasoningLevels: []string{"minimal", "low", "medium", "high", "xhigh"}, DisplayName: "Muse Spark 1.3 Free"},
+	"muse-spark-1.2-contributor-free": {ContextLength: 1048576, MaxCompletionTokens: 131072, InputModalities: []string{"text", "image"}, ReasoningLevels: []string{"minimal", "low", "medium", "high", "xhigh"}, DisplayName: "Muse Spark 1.2 Free"},
+	"longcat-2.5-preview-free":        {ContextLength: 1000000, MaxCompletionTokens: 131072, InputModalities: []string{"text", "image"}, DisplayName: "LongCat 2.5 Preview Free"},
+	"space-bunny-free":                {ContextLength: 1048576, MaxCompletionTokens: 524288, InputModalities: []string{"text", "image"}, ReasoningLevels: []string{"low", "medium", "high", "xhigh", "max"}, DisplayName: "Space Bunny Free"},
+	"big-pickle":                      {ContextLength: 200000, MaxCompletionTokens: 32000, DisplayName: "Big Pickle"},
+	"deepseek-v4-flash-free":          {ContextLength: 200000, MaxCompletionTokens: 128000, ReasoningLevels: []string{"low", "high", "max"}, DisplayName: "DeepSeek V4 Flash Free"},
+}
+
+// zenModelSpec looks up the built-in capability table for a model.
+func zenModelSpec(model string) (modelCapabilities, bool) {
+	caps, ok := defaultModelCapabilities[strings.ToLower(strings.TrimSpace(model))]
+	return caps, ok
 }
 
 // resolveModelCapabilities merges built-in defaults with explicit route
-// configuration; explicit values win.
+// configuration; explicit values win. Known models always announce thinking
+// support (all free-tier models reason); effort-type models list their levels.
 func resolveModelCapabilities(m modelRoute) modelCapabilities {
-	caps := defaultModelCapabilities[strings.ToLower(strings.TrimSpace(m.Model))]
+	caps, _ := zenModelSpec(m.Model)
 	if m.ContextLength > 0 {
 		caps.ContextLength = m.ContextLength
 	}
@@ -1037,10 +1067,13 @@ func resolveModelCapabilities(m modelRoute) modelCapabilities {
 		caps.InputModalities = m.InputModalities
 	}
 	if len(m.ReasoningLevels) > 0 {
+		caps.ReasoningLevels = m.ReasoningLevels
+	}
+	if _, known := zenModelSpec(m.Model); known || len(m.ReasoningLevels) > 0 {
 		caps.Thinking = &thinkingSupport{
 			ZeroAllowed:    true,
 			DynamicAllowed: true,
-			Levels:         m.ReasoningLevels,
+			Levels:         caps.ReasoningLevels,
 		}
 	}
 	return caps
@@ -1234,13 +1267,17 @@ func modelRegistration() ([]byte, error) {
 		// configure() and defaultZenModels guarantee Alias is non-empty.
 		alias := m.Alias
 		caps := resolveModelCapabilities(m)
+		displayName := caps.DisplayName
+		if displayName == "" {
+			displayName = m.Model
+		}
 		models = append(models, modelInfo{
 			ID:                       alias,
 			Object:                   "model",
 			Created:                  1735689600,
 			OwnedBy:                  cfg.Provider,
 			Type:                     "openai",
-			DisplayName:              m.Model,
+			DisplayName:              displayName,
 			ContextLength:            caps.ContextLength,
 			MaxCompletionTokens:      caps.MaxCompletionTokens,
 			SupportedInputModalities: caps.InputModalities,
@@ -1320,45 +1357,59 @@ func execute(payload []byte, stream bool) ([]byte, error) {
 func executeNonStream(req executorRequest, cfg pluginConfig, route modelRoute, baseURL string, headers map[string][]string, apiKey string) ([]byte, error) {
 	endpoints := candidateEndpoints(cfg, route)
 	var lastErr error
-	for _, ep := range endpoints {
-		r := route
-		r.Endpoint = ep
-		// Gate rule 4: zen only answers streaming requests; the SSE answer
-		// is folded below.
-		upstreamBody, err := prepareUpstreamBody(req, r)
-		if err != nil {
-			return nil, err
-		}
-		body, respHeaders, status, err := doUpstream(req.HostCallbackID, http.MethodPost, baseURL+r.EndpointPath(), headers, apiKey, upstreamBody)
-		if err != nil {
-			return nil, err
-		}
-		if status < 200 || status >= 300 {
-			lastErr = fmt.Errorf("zen upstream status %d: %s", status, truncate(body, 512))
-			if isEndpointMismatch(status) && ep == endpoints[0] && len(endpoints) > 1 {
-				continue // model may only be served on the other endpoint
-			}
-			return nil, lastErr
-		}
-		if ep != endpoints[0] {
-			rememberEndpoint(route.Model, ep)
-		}
-		folded, err := foldSSEToJSON(body, ep)
-		if err != nil {
-			return nil, err
-		}
-		if ep == "responses" {
-			// The plugin declares chat-completions output, so the folded
-			// responses object must become a chat.completion before the host
-			// translates it for the requesting client.
-			folded, err = responsesCompletionToChat(folded, req.Model)
+	authRetry := false
+	run := func(key string, hdrs map[string][]string) ([]byte, error) {
+		for _, ep := range endpoints {
+			r := route
+			r.Endpoint = ep
+			// Gate rule 4: zen only answers streaming requests; the SSE answer
+			// is folded below.
+			upstreamBody, err := prepareUpstreamBody(req, r)
 			if err != nil {
 				return nil, err
 			}
+			body, respHeaders, status, err := doUpstream(req.HostCallbackID, http.MethodPost, baseURL+r.EndpointPath(), hdrs, key, upstreamBody)
+			if err != nil {
+				return nil, err
+			}
+			if status < 200 || status >= 300 {
+				lastErr = fmt.Errorf("zen upstream status %d: %s", status, truncate(body, 512))
+				if isEndpointMismatch(status) && ep == endpoints[0] && len(endpoints) > 1 {
+					continue // model may only be served on the other endpoint
+				}
+				// Auth-level failures (401 credits/auth, 403 region/policy):
+				// retried once by the caller with a rotated key and a fresh
+				// session.
+				authRetry = status == 401 || status == 403
+				return nil, lastErr
+			}
+			if ep != endpoints[0] {
+				rememberEndpoint(route.Model, ep)
+			}
+			folded, err := foldSSEToJSON(body, ep)
+			if err != nil {
+				return nil, err
+			}
+			if ep == "responses" {
+				// The plugin declares chat-completions output, so the folded
+				// responses object must become a chat.completion before the host
+				// translates it for the requesting client.
+				folded, err = responsesCompletionToChat(folded, req.Model)
+				if err != nil {
+					return nil, err
+				}
+			}
+			return okEnvelopeJSON(executorResponse{Payload: folded, Headers: respHeaders})
 		}
-		return okEnvelopeJSON(executorResponse{Payload: folded, Headers: respHeaders})
+		return nil, lastErr
 	}
-	return nil, lastErr
+	out, err := run(apiKey, headers)
+	if err != nil && authRetry {
+		apiKey = nextAPIKey(cfg)
+		refreshGateSession(headers)
+		out, err = run(apiKey, headers)
+	}
+	return out, err
 }
 
 // baseURLForRequest resolves the upstream base URL. It checks the host-selected
@@ -1423,34 +1474,41 @@ func runStream(req executorRequest, cfg pluginConfig, route modelRoute, baseURL 
 	// path-level failure (400/404/405) from the first candidate is retried
 	// once against the opposite dialect and the winner is remembered.
 	endpoints := candidateEndpoints(cfg, route)
-	var resp *hostStreamHandle
-	usedEndpoint := route.Endpoint
-	for _, ep := range endpoints {
-		r := route
-		r.Endpoint = ep
-		// Gate rule 4: zen only answers streaming requests.
-		body, err := prepareUpstreamBody(req, r)
-		if err != nil {
-			closeStream(err.Error())
-			return
-		}
-		resp, err = doUpstreamStream(req.HostCallbackID, http.MethodPost, baseURL+r.EndpointPath(), headers, apiKey, body)
-		if err != nil {
-			closeStream(err.Error())
-			return
-		}
-		usedEndpoint = ep
-		if isEndpointMismatch(resp.StatusCode) && ep == endpoints[0] && len(endpoints) > 1 {
-			// Drain the error body so the abandoned host stream is reaped.
-			for i := 0; i < 8; i++ {
-				chunk, errRead := readHostStream(resp.StreamID)
-				if errRead != nil || chunk.Done || chunk.Error != "" {
-					break
-				}
+	selectUpstream := func(key string, hdrs map[string][]string) (*hostStreamHandle, string, string) {
+		var handle *hostStreamHandle
+		used := ""
+		for _, ep := range endpoints {
+			r := route
+			r.Endpoint = ep
+			// Gate rule 4: zen only answers streaming requests.
+			body, err := prepareUpstreamBody(req, r)
+			if err != nil {
+				return nil, "", err.Error()
 			}
-			continue
+			h, err := doUpstreamStream(req.HostCallbackID, http.MethodPost, baseURL+r.EndpointPath(), hdrs, key, body)
+			if err != nil {
+				return nil, "", err.Error()
+			}
+			handle = h
+			used = ep
+			if isEndpointMismatch(h.StatusCode) && ep == endpoints[0] && len(endpoints) > 1 {
+				// Drain the error body so the abandoned host stream is reaped.
+				for i := 0; i < 8; i++ {
+					chunk, errRead := readHostStream(h.StreamID)
+					if errRead != nil || chunk.Done || chunk.Error != "" {
+						break
+					}
+				}
+				continue
+			}
+			break
 		}
-		break
+		return handle, used, ""
+	}
+	resp, usedEndpoint, errMsg := selectUpstream(apiKey, headers)
+	if errMsg != "" {
+		closeStream(errMsg)
+		return
 	}
 	if resp == nil {
 		closeStream("zen upstream: no endpoint attempted")
@@ -1458,6 +1516,30 @@ func runStream(req executorRequest, cfg pluginConfig, route modelRoute, baseURL 
 	}
 	if usedEndpoint != endpoints[0] {
 		rememberEndpoint(route.Model, usedEndpoint)
+	}
+	if resp.StatusCode == 401 || resp.StatusCode == 403 {
+		// Auth-level failure (401 credits/auth, 403 region/policy): rotate
+		// the key and mint a fresh session, then retry once.
+		for i := 0; i < 8; i++ {
+			chunk, errRead := readHostStream(resp.StreamID)
+			if errRead != nil || chunk.Done || chunk.Error != "" {
+				break
+			}
+		}
+		apiKey = nextAPIKey(cfg)
+		refreshGateSession(headers)
+		resp, usedEndpoint, errMsg = selectUpstream(apiKey, headers)
+		if errMsg != "" {
+			closeStream(errMsg)
+			return
+		}
+		if resp == nil {
+			closeStream("zen upstream: no endpoint attempted")
+			return
+		}
+		if usedEndpoint != endpoints[0] {
+			rememberEndpoint(route.Model, usedEndpoint)
+		}
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		// Drain a bit of the error body for the message, then close.
@@ -1651,6 +1733,9 @@ func gateHeaders(req executorRequest) map[string][]string {
 	}
 	if session, ok := resolveSession(&req); ok {
 		headers[targetSessionHeader] = []string{session}
+		// The official client mirrors the session on both affinity headers.
+		headers["X-Session-Affinity"] = []string{session}
+		headers["X-Session-Id"] = []string{session}
 	}
 	return headers
 }
@@ -1759,6 +1844,14 @@ func prepareUpstreamBody(req executorRequest, route modelRoute) ([]byte, error) 
 	if known {
 		ensureGateTools(root, dialect)
 	}
+	if route.Endpoint == "responses" {
+		// The zen gateway keeps no server-side response state: replayed
+		// reasoning items (rs_ ids) and previous_response_id answer 400
+		// "Referenced reasoning item was not found or has expired".
+		sanitizeResponsesUpstreamInput(root)
+	}
+	normalizeReasoningEffort(root, route.Endpoint, route.Model)
+	clampMaxOutput(root, route.Model)
 
 	out, err := json.Marshal(root)
 	if err != nil {
@@ -2453,10 +2546,106 @@ func bodyDialect(root map[string]any) (string, bool) {
 	return "", false
 }
 
-// ensureGateTools appends minimal bash/read tool entries when missing, in
-// the dialect-appropriate shape.
+// officialGateTool describes one of the OpenCode client's six built-in
+// tools (bash, edit, glob, grep, read, write) with the official description
+// and parameter schema, used to fill gaps in client tool sets.
+type officialGateTool struct {
+	name        string
+	description string
+	parameters  map[string]any
+}
+
+// officialGateTools mirrors the OpenCode client's built-in tool set. The
+// zen free tier expects this set to be present; requests carrying no tools
+// at all (compaction/summarization, plain chat clients) get the full set
+// injected with tool_choice "none" so the gate passes while the model is
+// still barred from calling tools the client cannot execute.
+var officialGateTools = []officialGateTool{
+	{
+		name:        "bash",
+		description: "Execute bash commands in the workspace environment",
+		parameters: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"command": map[string]any{"type": "string", "description": "Shell command string to execute"},
+				"workdir": map[string]any{"type": "string", "description": "Working directory. Defaults to the active Location; relative paths resolve within it."},
+			},
+			"required": []any{"command"},
+		},
+	},
+	{
+		name:        "edit",
+		description: "Edit a file by replacing text",
+		parameters: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"path":       map[string]any{"type": "string", "description": "File path to edit. Relative paths resolve within the active Location."},
+				"oldString":  map[string]any{"type": "string", "description": "The string in the file to be replaced"},
+				"newString":  map[string]any{"type": "string", "description": "The string to replace oldString with"},
+				"replaceAll": map[string]any{"type": "boolean", "description": "Replace all occurrences of oldString (default false)"},
+			},
+			"required": []any{"path", "oldString", "newString"},
+		},
+	},
+	{
+		name:        "glob",
+		description: "Find files matching a glob pattern",
+		parameters: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"pattern": map[string]any{"type": "string", "description": "File pattern to include in the search (e.g. \"*.js\", \"*.{ts,tsx}\")"},
+				"path":    map[string]any{"type": "string", "description": "Relative directory to search in. Defaults to the active Location."},
+			},
+			"required": []any{"pattern"},
+		},
+	},
+	{
+		name:        "grep",
+		description: "Search file contents using regular expressions",
+		parameters: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"pattern": map[string]any{"type": "string", "description": "Regex pattern to search for in file contents"},
+				"path":    map[string]any{"type": "string", "description": "Relative directory to search in. Defaults to the active Location."},
+			},
+			"required": []any{"pattern"},
+		},
+	},
+	{
+		name:        "read",
+		description: "Read file contents",
+		parameters: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"path":   map[string]any{"type": "string", "description": "File path to read. Relative paths resolve within the active Location."},
+				"offset": map[string]any{"type": "number", "description": "The 1-based directory entry or text line offset"},
+				"limit":  map[string]any{"type": "number", "description": "The maximum number of lines to read (defaults to 2000)"},
+			},
+			"required": []any{"path"},
+		},
+	},
+	{
+		name:        "write",
+		description: "Write or overwrite file contents",
+		parameters: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"path":    map[string]any{"type": "string", "description": "File path to write. Relative paths resolve within the active Location."},
+				"content": map[string]any{"type": "string", "description": "Content to write to the file"},
+			},
+			"required": []any{"path", "content"},
+		},
+	},
+}
+
+// ensureGateTools aligns the tool set with the official client: any of the
+// six core tools missing from the request is appended (dialect-appropriate
+// shape) and the list is sorted by function name, matching the official
+// client's alphabetical ordering. Requests without any tools get the full
+// set plus tool_choice "none".
 func ensureGateTools(root map[string]any, dialect string) {
 	tools, _ := root["tools"].([]any)
+	hadTools := len(tools) > 0
 	names := map[string]bool{}
 	for _, item := range tools {
 		entry, ok := item.(map[string]any)
@@ -2465,19 +2654,23 @@ func ensureGateTools(root map[string]any, dialect string) {
 		}
 		names[toolEntryName(entry, dialect)] = true
 	}
-	var missing []string
-	for _, want := range []string{"bash", "read"} {
-		if !names[want] {
-			missing = append(missing, want)
+	for i := range officialGateTools {
+		if !names[officialGateTools[i].name] {
+			tools = append(tools, gateToolEntry(&officialGateTools[i], dialect))
 		}
 	}
-	if len(missing) == 0 {
-		return
-	}
-	for _, name := range missing {
-		tools = append(tools, gateToolEntry(name, dialect))
-	}
+	// Official clients send tools sorted by function name.
+	sort.SliceStable(tools, func(i, j int) bool {
+		a, _ := tools[i].(map[string]any)
+		b, _ := tools[j].(map[string]any)
+		return toolEntryName(a, dialect) < toolEntryName(b, dialect)
+	})
 	root["tools"] = tools
+	if !hadTools {
+		if _, exists := root["tool_choice"]; !exists {
+			root["tool_choice"] = "none"
+		}
+	}
 }
 
 func toolEntryName(entry map[string]any, dialect string) string {
@@ -2495,28 +2688,204 @@ func toolEntryName(entry map[string]any, dialect string) string {
 	return ""
 }
 
-func gateToolEntry(name, dialect string) map[string]any {
-	schema := map[string]any{"type": "object"}
-	description := "Runs a persistent bash shell session."
-	if name == "read" {
-		description = "Reads a file from the local filesystem."
-	}
+func gateToolEntry(tool *officialGateTool, dialect string) map[string]any {
 	if dialect == "chat" {
 		return map[string]any{
 			"type": "function",
 			"function": map[string]any{
-				"name":        name,
-				"description": description,
-				"parameters":  schema,
+				"name":        tool.name,
+				"description": tool.description,
+				"parameters":  tool.parameters,
 			},
 		}
 	}
 	return map[string]any{
 		"type":        "function",
-		"name":        name,
-		"description": description,
-		"parameters":  schema,
+		"name":        tool.name,
+		"description": tool.description,
+		"parameters":  tool.parameters,
 	}
+}
+
+// sanitizeResponsesUpstreamInput strips server-state references the zen
+// gateway does not retain: replayed reasoning items (their rs_ ids expire
+// upstream and answer 400 "Referenced reasoning item was not found or has
+// expired") and previous_response_id. Without this, agent clients that
+// replay reasoning items (pi via the codex responses dialect) fail every
+// follow-up turn and the repeated 400s get the credential marked
+// unavailable upstream (auth_unavailable cascade).
+func sanitizeResponsesUpstreamInput(root map[string]any) {
+	delete(root, "previous_response_id")
+	items, ok := root["input"].([]any)
+	if !ok {
+		return
+	}
+	out := make([]any, 0, len(items))
+	for _, item := range items {
+		entry, ok := item.(map[string]any)
+		if !ok {
+			out = append(out, item)
+			continue
+		}
+		if t, _ := entry["type"].(string); strings.EqualFold(t, "reasoning") {
+			continue
+		}
+		out = append(out, item)
+	}
+	root["input"] = out
+}
+
+// normalizeReasoningEffort clamps the requested reasoning effort to what
+// the model supports. The zen gateway resolves the effort into a provider
+// variant (reasoningEffort / reasoning_effort / reasoning.effort are all
+// read), and unsupported values answer 400 "Invalid request parameters".
+// Effort-type models keep values from their catalog level set; toggle-only
+// models (mimo, nemotron, ...) drop the parameter entirely; unknown models
+// fall back to the safe low/medium/high set. The anthropic-style top-level
+// "thinking" object is always removed.
+func normalizeReasoningEffort(root map[string]any, endpoint, model string) {
+	delete(root, "thinking")
+
+	effort := ""
+	if s, ok := root["reasoning_effort"].(string); ok {
+		effort = strings.ToLower(strings.TrimSpace(s))
+	}
+	if s, ok := root["reasoningEffort"].(string); ok && effort == "" {
+		effort = strings.ToLower(strings.TrimSpace(s))
+	}
+	reasoning, _ := root["reasoning"].(map[string]any)
+	if effort == "" {
+		if s, ok := reasoning["effort"].(string); ok {
+			effort = strings.ToLower(strings.TrimSpace(s))
+		}
+	}
+	delete(root, "reasoning_effort")
+	delete(root, "reasoningEffort")
+
+	spec, known := zenModelSpec(model)
+	if effort != "" {
+		switch {
+		case known && len(spec.ReasoningLevels) == 0:
+			// Toggle-only thinking: the effort parameter is rejected.
+			effort = ""
+		case known:
+			effort = clampEffortToLevels(effort, spec.ReasoningLevels)
+		default:
+			// Unknown model: only the universally safe set.
+			effort = clampEffortToLevels(effort, []string{"low", "medium", "high"})
+		}
+	}
+
+	if endpoint == "responses" {
+		if reasoning == nil && effort != "" {
+			reasoning = map[string]any{}
+		}
+		if reasoning != nil {
+			if effort != "" {
+				reasoning["effort"] = effort
+			} else {
+				delete(reasoning, "effort")
+			}
+			root["reasoning"] = reasoning
+		}
+		return
+	}
+	// Chat endpoint: the effort rides the top-level field; a leftover
+	// reasoning object has no chat-completions meaning.
+	delete(root, "reasoning")
+	if effort != "" {
+		root["reasoning_effort"] = effort
+	}
+}
+
+// clampEffortToLevels maps an effort value onto the supported level set.
+// An empty result means "drop the parameter".
+func clampEffortToLevels(effort string, levels []string) string {
+	has := func(v string) bool {
+		for _, l := range levels {
+			if l == v {
+				return true
+			}
+		}
+		return false
+	}
+	if has(effort) {
+		return effort
+	}
+	if effort == "off" || effort == "none" || effort == "" {
+		return ""
+	}
+	// Alias mapping: nearest supported level wins.
+	aliases := map[string][]string{
+		"max":     {"xhigh", "high"},
+		"xhigh":   {"high"},
+		"ultra":   {"high"},
+		"minimal": {"low"},
+		"mini":    {"low"},
+	}
+	for _, candidate := range aliases[effort] {
+		if has(candidate) {
+			return candidate
+		}
+	}
+	for _, fallback := range []string{"high", "medium", "low"} {
+		if has(fallback) {
+			return fallback
+		}
+	}
+	return ""
+}
+
+// clampMaxOutput caps the requested output tokens at the model's catalog
+// limit (65536 for unknown models) so oversized requests cannot fail with
+// 400 invalid parameters.
+func clampMaxOutput(root map[string]any, model string) {
+	limit := int64(65536)
+	if spec, known := zenModelSpec(model); known && spec.MaxCompletionTokens > 0 {
+		limit = spec.MaxCompletionTokens
+	}
+	for _, field := range []string{"max_tokens", "max_completion_tokens", "max_output_tokens"} {
+		if v, ok := root[field].(float64); ok && v > float64(limit) {
+			root[field] = float64(limit)
+		}
+	}
+}
+
+// officialIDAlphabet is the Base62 alphabet used by the OpenCode client's
+// Identifier ids.
+const officialIDAlphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+
+// newOfficialSessionID mints a session id in the official descending
+// format (ses_ + 12 hex chars of the bitwise-inverted millisecond timestamp
+// + 14 base62 chars), so the id decodes as freshly created. Used when a
+// retry needs a session the upstream has never seen.
+func newOfficialSessionID() string {
+	combined := uint64(time.Now().UnixMilli())<<12 | uint64(time.Now().UnixNano()&0xfff)
+	inverted := ^combined
+	const hexDigits = "0123456789abcdef"
+	var hexPart [12]byte
+	for i := 0; i < 6; i++ {
+		b := byte((inverted >> (40 - 8*i)) & 0xff)
+		hexPart[i*2] = hexDigits[b>>4]
+		hexPart[i*2+1] = hexDigits[b&0xf]
+	}
+	randBuf := make([]byte, 14)
+	_, _ = rand.Read(randBuf)
+	var suffix [14]byte
+	for i, b := range randBuf {
+		suffix[i] = officialIDAlphabet[int(b)%len(officialIDAlphabet)]
+	}
+	return "ses_" + string(hexPart[:]) + string(suffix[:])
+}
+
+// refreshGateSession replaces the session headers with a freshly minted
+// official id; used when retrying after auth-level failures.
+func refreshGateSession(headers map[string][]string) string {
+	session := newOfficialSessionID()
+	headers[targetSessionHeader] = []string{session}
+	headers["X-Session-Affinity"] = []string{session}
+	headers["X-Session-Id"] = []string{session}
+	return session
 }
 
 // firstUserText extracts the first user message text for the content-derived
