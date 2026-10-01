@@ -1560,11 +1560,14 @@ func TestModelRegistrationMergesDiscoveredModels(t *testing.T) {
 	for _, m := range resp.Result.Models {
 		seen[m.ID] = true
 	}
-	if !seen["jev-1.13-free"] {
-		t.Fatalf("discovered model missing: %v", seen)
+	// jev-1.13-free is served on /systemone (a structured state-evaluation
+	// API, not chat/responses), so announcing it would only produce a model
+	// that can never answer. The official endpoint table keeps it hidden.
+	if seen["jev-1.13-free"] {
+		t.Fatalf("unsupported-dialect model announced: %v", seen)
 	}
-	if len(resp.Result.Models) != len(defaultZenModels)+1 {
-		t.Fatalf("model count = %d, want %d (defaults + 1 new)", len(resp.Result.Models), len(defaultZenModels)+1)
+	if len(resp.Result.Models) != len(defaultZenModels) {
+		t.Fatalf("model count = %d, want %d (defaults only; mimo is a dup, jev unsupported)", len(resp.Result.Models), len(defaultZenModels))
 	}
 }
 

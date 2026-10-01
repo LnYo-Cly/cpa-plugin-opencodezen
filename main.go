@@ -431,41 +431,163 @@ func learnedEndpoint(model string) (string, bool) {
 	return ep, ok
 }
 
+// endpointUnsupported marks models whose upstream endpoint speaks a dialect
+// this plugin cannot translate (Anthropic Messages, Jev's /systemone, the
+// AI-SDK Gemini path). Requests to such models are refused up front instead
+// of being posted to a wrong path.
+const endpointUnsupported = "unsupported"
+
+// officialZenEndpoint classifies a model by its upstream endpoint per the
+// official OpenCode Zen docs endpoint table
+// (https://opencode.ai/docs/zh-cn/zen/#端点), snapshotted 2026-10-01.
+//
+// The table is a routing *hint*, never a source of truth:
+//   - model existence still comes from live /models discovery; the /models
+//     payload carries no endpoint field, so the docs are the only
+//     machine-usable source of endpoint data;
+//   - classification prefers family prefixes over per-model rows so
+//     undocumented ids (deepseek-v4-flash-free, muse-spark-1.2-...) and
+//     docs churn still classify correctly;
+//   - execute()/runStream() retry the opposite dialect on a path-level
+//     failure (400/404/405) unless the route is explicitly configured, so
+//     a stale entry self-corrects at runtime;
+//   - an explicit plugins.configs.zen models entry with an endpoint always
+//     wins, which is the escape hatch for any misclassification.
+func officialZenEndpoint(model string) (string, bool) {
+	lower := strings.ToLower(strings.TrimSpace(model))
+	if lower == "" {
+		return "", false
+	}
+	if ep, ok := officialZenEndpointModels[lower]; ok {
+		return ep, true
+	}
+	for _, rule := range officialZenEndpointPrefixes {
+		if strings.HasPrefix(lower, rule.prefix) {
+			return rule.endpoint, true
+		}
+	}
+	return "", false
+}
+
+// officialZenEndpointPrefixes maps model-id families to endpoints. Family
+// rules are used where the docs show a consistent family-wide endpoint.
+var officialZenEndpointPrefixes = []struct {
+	prefix   string
+	endpoint string
+}{
+	// Served on /responses (OpenAI-style).
+	{"gpt-", "responses"},
+	{"grok-", "responses"},
+	{"muse-", "responses"},
+	// Non-OpenAI dialects this plugin cannot speak.
+	{"claude-", endpointUnsupported}, // Anthropic /messages
+	{"gemini-", endpointUnsupported}, // AI-SDK Google path
+	{"jev-", endpointUnsupported},    // /systemone
+	// Served on /chat/completions (OpenAI-compatible).
+	{"deepseek-", "chat"},
+	{"glm-", "chat"},
+	{"kimi-", "chat"},
+	{"ling-", "chat"},
+	{"longcat-", "chat"},
+	{"minimax-", "chat"},
+	{"mimo-", "chat"},
+	{"nemotron-", "chat"},
+}
+
+// officialZenEndpointModels covers ids whose endpoint cannot be derived
+// from a family prefix.
+var officialZenEndpointModels = map[string]string{
+	"big-pickle":       "chat",
+	"space-bunny-free": "chat",
+	"qwen3.8-max":      "chat",
+	// Qwen models on the Anthropic Messages endpoint.
+	"qwen3.8-flash": endpointUnsupported,
+	"qwen3.7-max":   endpointUnsupported,
+	"qwen3.7-plus":  endpointUnsupported,
+	"qwen3.6-plus":  endpointUnsupported,
+	"qwen3.5-plus":  endpointUnsupported,
+}
+
+// candidateEndpoints returns the endpoints to attempt for a request, in
+// order. Explicit configuration pins a single endpoint; otherwise the
+// opposite dialect is tried once after a path-level failure so endpoint
+// hints that drift from reality self-correct.
+func candidateEndpoints(cfg pluginConfig, route modelRoute) []string {
+	first := "chat"
+	if route.Endpoint == "responses" {
+		first = "responses"
+	}
+	if routeConfigured(cfg, route.Model) {
+		return []string{first}
+	}
+	second := "chat"
+	if first == "chat" {
+		second = "responses"
+	}
+	return []string{first, second}
+}
+
+// isEndpointMismatch reports whether an upstream status looks like "wrong
+// path for this model" rather than a request we should never repeat.
+func isEndpointMismatch(status int) bool {
+	return status == 400 || status == 404 || status == 405
+}
+
 // routeConfigured reports whether the model has an explicit entry in plugin
-// config; learned-endpoint retries never override explicit configuration.
+// config *with a pinned endpoint*; only then is the endpoint authoritative
+// (learned endpoints and dialect retries never override it). An entry
+// without an endpoint (e.g. configured just for alias/capabilities) still
+// gets inference and retries.
 func routeConfigured(cfg pluginConfig, model string) bool {
 	for _, m := range cfg.Models {
 		if strings.EqualFold(m.Model, model) || strings.EqualFold(m.Alias, model) {
-			return true
+			if strings.TrimSpace(m.Endpoint) != "" {
+				return true
+			}
 		}
 	}
 	return false
 }
 
 // routeForModel resolves the route for a requested model id.
-// It checks explicit plugin configuration first; if none match, it automatically
-// infers the route so any model added in openai-compatibility works out of the box.
+// Endpoint resolution order: explicit config endpoint > endpoint learned
+// from a live retry > official endpoint table > name inference.
 func routeForModel(cfg pluginConfig, model string) (modelRoute, bool) {
 	model = strings.TrimSpace(model)
 	if model == "" {
 		return modelRoute{}, false
 	}
-	for _, m := range cfg.Models {
+	var configured *modelRoute
+	for i := range cfg.Models {
+		m := &cfg.Models[i]
 		if strings.EqualFold(m.Model, model) || strings.EqualFold(m.Alias, model) {
-			return m, true
+			if strings.TrimSpace(m.Endpoint) != "" {
+				return *m, true
+			}
+			if configured == nil {
+				configured = m
+			}
 		}
 	}
-	// Fallback to intelligent inference, refined by endpoints learned from
-	// live 400-retries (chat → responses).
-	r := modelRoute{
-		Model:    model,
-		Alias:    model,
-		Endpoint: inferEndpoint(model),
+	if configured != nil {
+		// Entry pins the upstream name/alias but not the endpoint: resolve
+		// the endpoint as if the model were unconfigured.
+		r := *configured
+		r.Endpoint = resolveEndpoint(model)
+		return r, true
 	}
+	return modelRoute{Model: model, Alias: model, Endpoint: resolveEndpoint(model)}, true
+}
+
+// resolveEndpoint picks the best endpoint hint for an unconfigured model.
+func resolveEndpoint(model string) string {
 	if ep, ok := learnedEndpoint(model); ok {
-		r.Endpoint = ep
+		return ep
 	}
-	return r, true
+	if ep, known := officialZenEndpoint(model); known && ep != endpointUnsupported {
+		return ep
+	}
+	return inferEndpoint(model)
 }
 
 // ---------------------------------------------------------------------------
@@ -1088,8 +1210,18 @@ func modelRegistration() ([]byte, error) {
 				}
 			}
 			if !dup {
-				// Endpoint is a guess; the 400-retry in execute()/runStream()
-				// self-corrects chat vs responses per model.
+				// Endpoint is a hint: the official endpoint table when we know
+				// the model, a name-based guess otherwise; execute()/runStream()
+				// retry the dialects anyway. Models on dialects this plugin
+				// cannot speak are not announced at all — selecting them could
+				// never work.
+				if ep, known := officialZenEndpoint(id); known {
+					if ep == endpointUnsupported {
+						continue
+					}
+					declared = append(declared, modelRoute{Model: id, Alias: id, Endpoint: ep})
+					continue
+				}
 				declared = append(declared, modelRoute{Model: id, Alias: id, Endpoint: inferEndpoint(id)})
 			}
 		}
@@ -1153,6 +1285,11 @@ func execute(payload []byte, stream bool) ([]byte, error) {
 	if !ok {
 		return nil, fmt.Errorf("zen provider has no model %q", req.Model)
 	}
+	if !routeConfigured(cfg, route.Model) {
+		if ep, known := officialZenEndpoint(route.Model); known && ep == endpointUnsupported {
+			return nil, fmt.Errorf("zen model %q is served on a dialect this plugin cannot speak (Anthropic Messages / systemone / AI-SDK path); set an explicit models endpoint in plugins.configs.zen to override", route.Model)
+		}
+	}
 
 	apiKey := apiKeyForRequest(req, cfg)
 	if apiKey == "" {
@@ -1177,13 +1314,11 @@ func execute(payload []byte, stream bool) ([]byte, error) {
 }
 
 // executeNonStream streams from zen and folds the SSE answer into one JSON
-// payload. When the model has no explicit endpoint config and /chat/completions
-// answers 400, it retries once against /responses and remembers the endpoint.
+// payload. Without an explicitly configured endpoint, a path-level failure
+// (400/404/405) on the first candidate dialect is retried once against the
+// opposite endpoint and the winner is remembered.
 func executeNonStream(req executorRequest, cfg pluginConfig, route modelRoute, baseURL string, headers map[string][]string, apiKey string) ([]byte, error) {
-	endpoints := []string{route.Endpoint}
-	if route.Endpoint == "chat" && !routeConfigured(cfg, route.Model) {
-		endpoints = append(endpoints, "responses")
-	}
+	endpoints := candidateEndpoints(cfg, route)
 	var lastErr error
 	for _, ep := range endpoints {
 		r := route
@@ -1200,12 +1335,12 @@ func executeNonStream(req executorRequest, cfg pluginConfig, route modelRoute, b
 		}
 		if status < 200 || status >= 300 {
 			lastErr = fmt.Errorf("zen upstream status %d: %s", status, truncate(body, 512))
-			if status == 400 && ep == "chat" && len(endpoints) > 1 {
-				continue // model may be responses-only upstream
+			if isEndpointMismatch(status) && ep == endpoints[0] && len(endpoints) > 1 {
+				continue // model may only be served on the other endpoint
 			}
 			return nil, lastErr
 		}
-		if ep != route.Endpoint {
+		if ep != endpoints[0] {
 			rememberEndpoint(route.Model, ep)
 		}
 		folded, err := foldSSEToJSON(body, ep)
@@ -1284,12 +1419,10 @@ func runStream(req executorRequest, cfg pluginConfig, route modelRoute, baseURL 
 		}
 	}()
 
-	// Endpoint auto-detection: without explicit config, a 400 from
-	// /chat/completions is retried once against /responses and remembered.
-	endpoints := []string{route.Endpoint}
-	if route.Endpoint == "chat" && !routeConfigured(cfg, route.Model) {
-		endpoints = append(endpoints, "responses")
-	}
+	// Endpoint auto-detection: without an explicitly configured endpoint, a
+	// path-level failure (400/404/405) from the first candidate is retried
+	// once against the opposite dialect and the winner is remembered.
+	endpoints := candidateEndpoints(cfg, route)
 	var resp *hostStreamHandle
 	usedEndpoint := route.Endpoint
 	for _, ep := range endpoints {
@@ -1307,7 +1440,7 @@ func runStream(req executorRequest, cfg pluginConfig, route modelRoute, baseURL 
 			return
 		}
 		usedEndpoint = ep
-		if resp.StatusCode == 400 && ep == "chat" && len(endpoints) > 1 {
+		if isEndpointMismatch(resp.StatusCode) && ep == endpoints[0] && len(endpoints) > 1 {
 			// Drain the error body so the abandoned host stream is reaped.
 			for i := 0; i < 8; i++ {
 				chunk, errRead := readHostStream(resp.StreamID)
@@ -1323,7 +1456,7 @@ func runStream(req executorRequest, cfg pluginConfig, route modelRoute, baseURL 
 		closeStream("zen upstream: no endpoint attempted")
 		return
 	}
-	if usedEndpoint != route.Endpoint {
+	if usedEndpoint != endpoints[0] {
 		rememberEndpoint(route.Model, usedEndpoint)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
@@ -1805,8 +1938,13 @@ func responsesToChat(root map[string]any) error {
 				continue
 			}
 			message := map[string]any{"role": entry["role"]}
+			// chat-completions has no "developer" role; strict upstreams
+			// reject it outright.
+			if r, ok := message["role"].(string); ok && strings.EqualFold(r, "developer") {
+				message["role"] = "system"
+			}
 			if content, ok := entry["content"]; ok {
-				message["content"] = renamePartType(content, "text", "input_text", "output_text")
+				message["content"] = responsesPartsToChat(content)
 			}
 			messages = append(messages, message)
 		}
@@ -1827,7 +1965,147 @@ func responsesToChat(root map[string]any) error {
 		}
 		delete(root, "text")
 	}
+	applyResponsesToChatFields(root)
 	return nil
+}
+
+// responsesOnlyRequestFields are Responses API request fields with no
+// chat-completions equivalent. Strict chat upstreams (zen included, it
+// already rejects strict:null inside tool schemas) answer 400
+// unknown_parameter when they leak through.
+//
+// "reasoning" is deliberately kept: chat dialects disagree on the
+// replacement (reasoning_effort vs nothing) and current payloads already
+// work end to end.
+var responsesOnlyRequestFields = []string{
+	"store", "background", "include", "prompt_cache_key",
+	"safety_identifier", "max_tool_calls", "truncation",
+}
+
+// chatOnlyRequestFields are chat-completions request fields with no
+// Responses API equivalent; strict /responses upstreams reject them.
+var chatOnlyRequestFields = []string{
+	"stream_options", "logit_bias", "logprobs", "top_logprobs",
+	"n", "prediction", "max_tokens", "max_completion_tokens",
+}
+
+// applyResponsesToChatFields normalizes top-level request parameters when
+// converting a Responses payload for a chat-completions upstream.
+func applyResponsesToChatFields(root map[string]any) {
+	if v, ok := root["max_output_tokens"]; ok {
+		if _, has := root["max_tokens"]; !has {
+			root["max_tokens"] = v
+		}
+		delete(root, "max_output_tokens")
+	}
+	for _, k := range responsesOnlyRequestFields {
+		delete(root, k)
+	}
+	reshapeToolChoice(root, "chat")
+}
+
+// applyChatToResponsesFields normalizes top-level request parameters when
+// converting a chat-completions payload for a /responses upstream.
+func applyChatToResponsesFields(root map[string]any) {
+	// Legacy functions → tools (the flat functions shape is already the
+	// responses tool shape, minus the type tag).
+	if _, ok := root["tools"]; !ok {
+		if fns, ok := root["functions"].([]any); ok && len(fns) > 0 {
+			tools := make([]any, 0, len(fns))
+			for _, fn := range fns {
+				if m, ok := fn.(map[string]any); ok {
+					inner := make(map[string]any, len(m))
+					for k, v := range m {
+						if k == "type" {
+							continue
+						}
+						inner[k] = v
+					}
+					tools = append(tools, map[string]any{"type": "function", "function": inner})
+					continue
+				}
+				tools = append(tools, fn)
+			}
+			root["tools"] = tools
+		}
+	}
+	// Legacy function_call maps onto tool_choice where it still can.
+	if _, has := root["tool_choice"]; !has {
+		if fc, ok := root["function_call"].(string); ok && (fc == "none" || fc == "required") {
+			root["tool_choice"] = fc
+		}
+	}
+	delete(root, "functions")
+	delete(root, "function_call")
+	// max tokens: the Responses API only knows max_output_tokens. Prefer
+	// max_completion_tokens (reasoning models reject max_tokens on chat).
+	if v, ok := root["max_completion_tokens"]; ok {
+		root["max_output_tokens"] = v
+	} else if v, ok := root["max_tokens"]; ok {
+		root["max_output_tokens"] = v
+	}
+	for _, k := range chatOnlyRequestFields {
+		delete(root, k)
+	}
+	// chat json_schema response_format nests under "json_schema"; the
+	// responses format object carries the same fields flat.
+	if rf, ok := root["response_format"].(map[string]any); ok {
+		if t, _ := rf["type"].(string); t == "json_schema" {
+			if inner, ok := rf["json_schema"].(map[string]any); ok {
+				flat := make(map[string]any, len(inner)+1)
+				for k, v := range inner {
+					flat[k] = v
+				}
+				flat["type"] = "json_schema"
+				root["response_format"] = flat
+			}
+		}
+	}
+	reshapeToolChoice(root, "responses")
+}
+
+// reshapeToolChoice converts the function tool_choice object between the
+// chat-completions ({"type":"function","function":{"name":...}}) and
+// responses ({"type":"function","name":...}) shapes. Other values
+// (auto/none/required, hosted tools) pass through unchanged.
+func reshapeToolChoice(root map[string]any, to string) {
+	tc, ok := root["tool_choice"].(map[string]any)
+	if !ok {
+		return
+	}
+	if t, _ := tc["type"].(string); t != "function" {
+		return
+	}
+	switch to {
+	case "chat":
+		if _, nested := tc["function"].(map[string]any); nested {
+			return
+		}
+		name, _ := tc["name"].(string)
+		if name == "" {
+			return
+		}
+		root["tool_choice"] = map[string]any{
+			"type":     "function",
+			"function": map[string]any{"name": name},
+		}
+	case "responses":
+		fn, nested := tc["function"].(map[string]any)
+		if !nested {
+			return
+		}
+		name, _ := fn["name"].(string)
+		if name == "" {
+			return
+		}
+		out := map[string]any{"type": "function", "name": name}
+		if strict, ok := fn["strict"]; ok && strict != nil {
+			// nil-valued strict is dropped like everywhere else: strict
+			// upstreams reject strict:null.
+			out["strict"] = strict
+		}
+		root["tool_choice"] = out
+	}
 }
 
 // toolOutputContent flattens a responses function_call_output "output"
@@ -1907,6 +2185,93 @@ func renamePartType(content any, toType string, fromTypes ...string) any {
 	return out
 }
 
+// assistantText extracts an assistant message's plain text from either a
+// string content or a parts array (text / output_text parts).
+func assistantText(content any) string {
+	switch c := content.(type) {
+	case string:
+		if strings.TrimSpace(c) == "" {
+			return ""
+		}
+		return c
+	case []any:
+		var b strings.Builder
+		for _, item := range c {
+			part, ok := item.(map[string]any)
+			if !ok {
+				continue
+			}
+			if pt, _ := part["type"].(string); pt != "text" && pt != "output_text" {
+				continue
+			}
+			if s, ok := part["text"].(string); ok {
+				b.WriteString(s)
+			}
+		}
+		return b.String()
+	default:
+		return ""
+	}
+}
+
+// responsesPartsToChat normalizes Responses API content parts for a
+// chat-completions upstream: text part types are renamed and input images
+// become image_url parts (with "detail" moved inside the image_url object).
+// Malformed image parts are passed through untouched.
+func responsesPartsToChat(content any) any {
+	renamed := renamePartType(content, "text", "input_text", "output_text")
+	parts, ok := renamed.([]any)
+	if !ok {
+		return renamed
+	}
+	out := make([]any, 0, len(parts))
+	changed := false
+	for _, item := range parts {
+		part, ok := item.(map[string]any)
+		if !ok {
+			out = append(out, item)
+			continue
+		}
+		if pt, _ := part["type"].(string); !strings.EqualFold(pt, "input_image") {
+			out = append(out, item)
+			continue
+		}
+		var urlObj map[string]any
+		switch u := part["image_url"].(type) {
+		case string:
+			urlObj = map[string]any{"url": u}
+		case map[string]any:
+			urlObj = make(map[string]any, len(u)+1)
+			for k, v := range u {
+				urlObj[k] = v
+			}
+		default:
+			out = append(out, item)
+			continue
+		}
+		if detail := part["detail"]; detail != nil {
+			urlObj["detail"] = detail
+		}
+		converted := make(map[string]any, len(part))
+		for k, v := range part {
+			switch k {
+			case "type", "image_url", "detail":
+				continue
+			default:
+				converted[k] = v
+			}
+		}
+		converted["type"] = "image_url"
+		converted["image_url"] = urlObj
+		out = append(out, converted)
+		changed = true
+	}
+	if !changed {
+		return renamed
+	}
+	return out
+}
+
 func responsesToolsToChat(tools []any) []any {
 	out := make([]any, 0, len(tools))
 	for _, item := range tools {
@@ -1929,15 +2294,15 @@ func responsesToolsToChat(tools []any) []any {
 			out = append(out, tool)
 			continue
 		}
-		fn, ok := tool["function"].(map[string]any)
-		if !ok {
-			fn = make(map[string]any, len(tool))
-			for k, v := range tool {
-				if k == "type" {
-					continue
-				}
-				fn[k] = v
+		// Flat responses tool → wrap into the chat function shape. (The
+		// tool["function"] branch above already handled chat-shaped input,
+		// so this branch only ever sees flat entries.)
+		fn := make(map[string]any, len(tool))
+		for k, v := range tool {
+			if k == "type" {
+				continue
 			}
+			fn[k] = v
 		}
 		// zen rejects "strict": null (pi sends it on every tool); drop null-valued keys.
 		for k, v := range fn {
@@ -1945,8 +2310,7 @@ func responsesToolsToChat(tools []any) []any {
 				delete(fn, k)
 			}
 		}
-		converted := map[string]any{"type": "function", "function": fn}
-		out = append(out, converted)
+		out = append(out, map[string]any{"type": "function", "function": fn})
 	}
 	return out
 }
@@ -1993,7 +2357,9 @@ func chatToResponses(root map[string]any) error {
 		// tool_calls here would erase the model's own calls from history.
 		if role == "assistant" {
 			if calls, ok := entry["tool_calls"].([]any); ok && len(calls) > 0 {
-				if text, ok := entry["content"].(string); ok && strings.TrimSpace(text) != "" {
+				// The assistant's text must survive alongside the calls;
+				// string and parts-array contents are both common.
+				if text := assistantText(entry["content"]); text != "" {
 					input = append(input, map[string]any{
 						"type":    "message",
 						"role":    "assistant",
@@ -2035,6 +2401,10 @@ func chatToResponses(root map[string]any) error {
 	}
 	root["input"] = input
 
+	// Parameter hygiene must run before the tools dialect conversion so the
+	// legacy functions fallback participates in it.
+	applyChatToResponsesFields(root)
+
 	if tools, ok := root["tools"].([]any); ok {
 		root["tools"] = chatToolsToResponses(tools)
 	}
@@ -2060,6 +2430,11 @@ func chatToolsToResponses(tools []any) []any {
 		}
 		converted := make(map[string]any, len(fn)+1)
 		for k, v := range fn {
+			// Same rule as the other direction: strict upstreams reject
+			// null-valued keys (pi sends strict:null on every tool).
+			if v == nil {
+				continue
+			}
 			converted[k] = v
 		}
 		converted["type"] = "function"
@@ -2590,6 +2965,7 @@ func foldChatSSE(sse []byte) ([]byte, error) {
 		content                 strings.Builder
 		toolCalls               = map[int]*bytes.Buffer{}
 		toolNames               = map[int]string{}
+		toolIDs                 = map[int]string{}
 		toolOrder               []int
 		usage                   json.RawMessage
 	)
@@ -2639,11 +3015,22 @@ func foldChatSSE(sse []byte) ([]byte, error) {
 				if tc.Function.Name != "" {
 					toolNames[tc.Index] = tc.Function.Name
 				}
+				// Preserve the upstream tool call id: fabricated ids break
+				// call_id pairing in responses dialects and in agent clients.
+				if tc.ID != "" {
+					toolIDs[tc.Index] = tc.ID
+				}
 			}
 			if choice.FinishReason != nil && *choice.FinishReason != "" {
 				finish = *choice.FinishReason
 			}
 		}
+	}
+	// Some upstreams never emit a role delta; the folded message must still
+	// carry a role or downstream translators drop it as malformed (which
+	// reads as an empty reply to the client).
+	if role == "" {
+		role = "assistant"
 	}
 	message := map[string]any{"role": role}
 	if content.Len() > 0 {
@@ -2654,8 +3041,12 @@ func foldChatSSE(sse []byte) ([]byte, error) {
 	if len(toolCalls) > 0 {
 		calls := make([]any, 0, len(toolCalls))
 		for _, idx := range toolOrder {
+			id := toolIDs[idx]
+			if id == "" {
+				id = fmt.Sprintf("call_%d", idx)
+			}
 			calls = append(calls, map[string]any{
-				"id":   fmt.Sprintf("call_%d", idx),
+				"id":   id,
 				"type": "function",
 				"function": map[string]any{
 					"name":      toolNames[idx],
@@ -2670,9 +3061,6 @@ func foldChatSSE(sse []byte) ([]byte, error) {
 	}
 	if finish == "" {
 		finish = "stop"
-	}
-	if role == "" {
-		role = "assistant"
 	}
 	out := map[string]any{
 		"id":     id,
@@ -2691,7 +3079,8 @@ func foldChatSSE(sse []byte) ([]byte, error) {
 }
 
 type toolCallDelta struct {
-	Index    int `json:"index"`
+	Index    int    `json:"index"`
+	ID       string `json:"id"`
 	Function struct {
 		Name      string `json:"name"`
 		Arguments string `json:"arguments"`
@@ -2729,13 +3118,16 @@ func foldResponsesSSE(sse []byte) ([]byte, error) {
 			if len(ev.Item) > 0 {
 				output = append(output, ev.Item)
 			}
-		case "response.completed":
-			// The completed event carries the full response; prefer it.
-			var completed struct {
+		case "response.completed", "response.incomplete", "response.failed":
+			// Terminal events carry the full response object; prefer it.
+			// incomplete/failed must do the same as completed, or a truncated
+			// answer is folded with status "completed" and no usage, silently
+			// reporting a partial reply as a complete one.
+			var terminal struct {
 				Response json.RawMessage `json:"response"`
 			}
-			if err := json.Unmarshal([]byte(frame), &completed); err == nil && len(completed.Response) > 0 {
-				return completed.Response, nil
+			if err := json.Unmarshal([]byte(frame), &terminal); err == nil && len(terminal.Response) > 0 {
+				return terminal.Response, nil
 			}
 			if len(ev.Usage) > 0 && string(ev.Usage) != "null" {
 				usage = ev.Usage
@@ -2819,15 +3211,20 @@ func newResponsesChatStreamConverter(model string) *responsesChatStreamConverter
 // zero or more chat chunk JSON payloads. A non-JSON payload is dropped.
 func (c *responsesChatStreamConverter) convert(payload []byte) ([][]byte, error) {
 	var ev struct {
-		Type      string `json:"type"`
-		ItemID    string `json:"item_id"`
-		Delta     string `json:"delta"`
-		Arguments string `json:"arguments"`
+		Type      string          `json:"type"`
+		ItemID    string          `json:"item_id"`
+		Delta     string          `json:"delta"`
+		Arguments string          `json:"arguments"`
+		Input     json.RawMessage `json:"input"`
 		Response  struct {
 			ID        string `json:"id"`
 			CreatedAt int64  `json:"created_at"`
 			Status    string `json:"status"`
-			Error     *struct {
+
+			IncompleteDetails *struct {
+				Reason string `json:"reason"`
+			} `json:"incomplete_details"`
+			Error *struct {
 				Message string `json:"message"`
 			} `json:"error"`
 			Usage *struct {
@@ -2837,11 +3234,12 @@ func (c *responsesChatStreamConverter) convert(payload []byte) ([][]byte, error)
 			} `json:"usage"`
 		} `json:"response"`
 		Item struct {
-			ID        string `json:"id"`
-			Type      string `json:"type"`
-			CallID    string `json:"call_id"`
-			Name      string `json:"name"`
-			Arguments string `json:"arguments"`
+			ID        string          `json:"id"`
+			Type      string          `json:"type"`
+			CallID    string          `json:"call_id"`
+			Name      string          `json:"name"`
+			Arguments string          `json:"arguments"`
+			Input     json.RawMessage `json:"input"`
 			Content   []struct {
 				Type string `json:"type"`
 				Text string `json:"text"`
@@ -2864,7 +3262,7 @@ func (c *responsesChatStreamConverter) convert(payload []byte) ([][]byte, error)
 		// A function_call item announces the tool invocation: emit the
 		// chat-completions tool_calls head (id + name, empty arguments) so
 		// downstream translators can map it to a function_call item.
-		if ev.Item.Type == "function_call" {
+		if ev.Item.Type == "function_call" || ev.Item.Type == "custom_tool_call" {
 			idx := c.toolIndexFor(ev.Item.ID)
 			c.toolCallN++
 			id := ev.Item.CallID
@@ -2884,7 +3282,7 @@ func (c *responsesChatStreamConverter) convert(payload []byte) ([][]byte, error)
 			}, nil, nil)}, nil
 		}
 		return nil, nil
-	case "response.function_call_arguments.delta":
+	case "response.function_call_arguments.delta", "response.custom_tool_call_input.delta":
 		if ev.ItemID != "" {
 			c.sawDelta[ev.ItemID] = true
 			c.toolArgs[ev.ItemID] = true
@@ -2900,18 +3298,27 @@ func (c *responsesChatStreamConverter) convert(payload []byte) ([][]byte, error)
 				},
 			}},
 		}, nil, nil)}, nil
-	case "response.function_call_arguments.done":
+	case "response.function_call_arguments.done", "response.custom_tool_call_input.done":
 		// Upstreams that do not stream argument fragments deliver the full
 		// argument string once here; emit it unless deltas already covered it.
 		if ev.ItemID != "" && !c.toolArgs[ev.ItemID] {
 			c.toolArgs[ev.ItemID] = true
 			c.sawDelta[ev.ItemID] = true
-			if ev.Arguments != "" {
+			if args := ev.Arguments; args != "" {
 				return [][]byte{c.chunk(map[string]any{
 					"tool_calls": []any{map[string]any{
 						"index": c.toolIndexFor(ev.ItemID),
 						"function": map[string]any{
-							"arguments": ev.Arguments,
+							"arguments": args,
+						},
+					}},
+				}, nil, nil)}, nil
+			} else if args := rawString(ev.Input); args != "" {
+				return [][]byte{c.chunk(map[string]any{
+					"tool_calls": []any{map[string]any{
+						"index": c.toolIndexFor(ev.ItemID),
+						"function": map[string]any{
+							"arguments": args,
 						},
 					}},
 				}, nil, nil)}, nil
@@ -2937,42 +3344,46 @@ func (c *responsesChatStreamConverter) convert(payload []byte) ([][]byte, error)
 	case "response.output_item.done":
 		// Fallback: an item completed without streamed deltas (some upstreams
 		// only send the final item). Emit its text once.
-		if ev.Item.Type == "function_call" {
-			if ev.Item.ID == "" || c.sawDelta[ev.Item.ID] {
+		if ev.Item.Type != "function_call" && ev.Item.Type != "custom_tool_call" {
+			if ev.Item.Type != "message" || ev.Item.ID == "" || c.sawDelta[ev.Item.ID] {
 				return nil, nil
 			}
-			c.sawDelta[ev.Item.ID] = true
-			c.toolArgs[ev.Item.ID] = true
-			c.toolCallN++
-			id := ev.Item.CallID
-			if id == "" {
-				id = ev.Item.ID
+			var text strings.Builder
+			for _, part := range ev.Item.Content {
+				if part.Type == "output_text" || part.Type == "text" {
+					text.WriteString(part.Text)
+				}
 			}
-			return [][]byte{c.chunk(map[string]any{
-				"tool_calls": []any{map[string]any{
-					"index": c.toolIndexFor(ev.Item.ID),
-					"id":    id,
-					"type":  "function",
-					"function": map[string]any{
-						"name":      ev.Item.Name,
-						"arguments": ev.Item.Arguments,
-					},
-				}},
-			}, nil, nil)}, nil
+			if text.Len() == 0 {
+				return nil, nil
+			}
+			return [][]byte{c.chunk(map[string]any{"content": text.String()}, nil, nil)}, nil
 		}
-		if ev.Item.Type != "message" || ev.Item.ID == "" || c.sawDelta[ev.Item.ID] {
+		if ev.Item.ID == "" || c.sawDelta[ev.Item.ID] {
 			return nil, nil
 		}
-		var text strings.Builder
-		for _, part := range ev.Item.Content {
-			if part.Type == "output_text" || part.Type == "text" {
-				text.WriteString(part.Text)
-			}
+		c.sawDelta[ev.Item.ID] = true
+		c.toolArgs[ev.Item.ID] = true
+		c.toolCallN++
+		id := ev.Item.CallID
+		if id == "" {
+			id = ev.Item.ID
 		}
-		if text.Len() == 0 {
-			return nil, nil
+		args := ev.Item.Arguments
+		if args == "" {
+			args = rawString(ev.Item.Input)
 		}
-		return [][]byte{c.chunk(map[string]any{"content": text.String()}, nil, nil)}, nil
+		return [][]byte{c.chunk(map[string]any{
+			"tool_calls": []any{map[string]any{
+				"index": c.toolIndexFor(ev.Item.ID),
+				"id":    id,
+				"type":  "function",
+				"function": map[string]any{
+					"name":      ev.Item.Name,
+					"arguments": args,
+				},
+			}},
+		}, nil, nil)}, nil
 	case "response.completed":
 		var usage map[string]any
 		if ev.Response.Usage != nil {
@@ -2987,8 +3398,25 @@ func (c *responsesChatStreamConverter) convert(payload []byte) ([][]byte, error)
 			finish = "tool_calls"
 		}
 		return [][]byte{c.chunk(map[string]any{}, strPtr(finish), usage)}, nil
-	case "response.failed", "response.incomplete":
-		msg := "upstream response " + ev.Type
+	case "response.incomplete":
+		// Truncated upstream responses are not failures: everything streamed
+		// so far is valid, so finish the chat stream normally instead of
+		// erroring the turn away.
+		var usage map[string]any
+		if ev.Response.Usage != nil {
+			usage = map[string]any{
+				"prompt_tokens":     ev.Response.Usage.InputTokens,
+				"completion_tokens": ev.Response.Usage.OutputTokens,
+				"total_tokens":      ev.Response.Usage.TotalTokens,
+			}
+		}
+		finish := "length"
+		if r := ev.Response.IncompleteDetails; r != nil && r.Reason != "" && r.Reason != "max_output_tokens" {
+			finish = "content_filter"
+		}
+		return [][]byte{c.chunk(map[string]any{}, strPtr(finish), usage)}, nil
+	case "response.failed":
+		msg := "upstream response failed"
 		if ev.Response.Error != nil && ev.Response.Error.Message != "" {
 			msg = ev.Response.Error.Message
 		} else if ev.Response.Status != "" {
@@ -3046,16 +3474,20 @@ func (c *responsesChatStreamConverter) chunk(delta map[string]any, finish *strin
 // into a chat.completion object for the non-streaming path.
 func responsesCompletionToChat(body []byte, model string) ([]byte, error) {
 	var resp struct {
-		ID        string `json:"id"`
-		Model     string `json:"model"`
-		Status    string `json:"status"`
-		CreatedAt int64  `json:"created_at"`
-		Output    []struct {
-			Type      string `json:"type"`
-			Role      string `json:"role"`
-			CallID    string `json:"call_id"`
-			Name      string `json:"name"`
-			Arguments string `json:"arguments"`
+		ID                string `json:"id"`
+		Model             string `json:"model"`
+		Status            string `json:"status"`
+		CreatedAt         int64  `json:"created_at"`
+		IncompleteDetails *struct {
+			Reason string `json:"reason"`
+		} `json:"incomplete_details"`
+		Output []struct {
+			Type      string          `json:"type"`
+			Role      string          `json:"role"`
+			CallID    string          `json:"call_id"`
+			Name      string          `json:"name"`
+			Arguments string          `json:"arguments"`
+			Input     json.RawMessage `json:"input"`
 			Content   []struct {
 				Type string `json:"type"`
 				Text string `json:"text"`
@@ -3098,19 +3530,23 @@ func responsesCompletionToChat(body []byte, model string) ([]byte, error) {
 			for _, sum := range item.Summary {
 				reasoning.WriteString(sum.Text)
 			}
-		case "function_call":
+		case "function_call", "custom_tool_call":
 			// Tool invocations must survive the responses -> chat fold, or
 			// agent clients never see the model's tool calls.
 			id := item.CallID
 			if id == "" {
 				id = canonicalID("call", item.Name+item.Arguments)
 			}
+			args := item.Arguments
+			if args == "" {
+				args = rawString(item.Input)
+			}
 			toolCalls = append(toolCalls, map[string]any{
 				"id":   id,
 				"type": "function",
 				"function": map[string]any{
 					"name":      item.Name,
-					"arguments": item.Arguments,
+					"arguments": args,
 				},
 			})
 		}
@@ -3134,6 +3570,13 @@ func responsesCompletionToChat(body []byte, model string) ([]byte, error) {
 	if len(toolCalls) > 0 {
 		message["tool_calls"] = toolCalls
 		finish = "tool_calls"
+	} else if resp.Status == "incomplete" {
+		// Truncated (not failed) upstream: report the chat finish reason
+		// that matches the truncation cause instead of claiming "stop".
+		finish = "length"
+		if r := resp.IncompleteDetails; r != nil && r.Reason != "" && r.Reason != "max_output_tokens" {
+			finish = "content_filter"
+		}
 	}
 	m := map[string]any{
 		"id":      id,
@@ -3168,6 +3611,20 @@ func stripSSEDataFraming(frame []byte) string {
 
 // strPtr is a tiny helper for optional string fields.
 func strPtr(s string) *string { return &s }
+
+// rawString decodes an event field that is a JSON string in the spec but
+// may arrive as an arbitrary JSON value (custom tool inputs). Objects are
+// returned as their compact JSON text.
+func rawString(raw json.RawMessage) string {
+	if len(raw) == 0 || string(raw) == "null" {
+		return ""
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		return s
+	}
+	return string(raw)
+}
 
 func truncate(b []byte, n int) string {
 	s := strings.TrimSpace(string(b))
