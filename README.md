@@ -230,6 +230,10 @@ curl -s -N http://localhost:8080/backend-api/codex/responses \
 - [cpa-plugin-opencode-session-mapper](https://github.com/ahoo/cpa-plugin-opencode-session-mapper) - 会话头映射插件的先行者，为会话 ID 规范化处理提供了思路。
 - [OpenCode2API](https://github.com/TiaraBasori/OpenCode2API) - 早期的 OpenCode 接入探索，为 Zen 免费层伪装提供了宝贵参考。
 
+## 友情链接
+
+- [linux.do 开源推广帖](https://linux.do/t/topic/2974408) 
+
 ---
 
 ## License
